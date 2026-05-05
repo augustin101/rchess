@@ -75,11 +75,11 @@ impl Game {
         game
     }
 
-    fn apply(&mut self, mv: Move) {
+    fn apply(&mut self, mv: Move, from_book: bool) {
         self.board_history.push(self.board.clone());
         let san = move_to_san(&self.board, mv);
         self.last_move = Some((mv.from_sq().0, mv.to_sq().0));
-        self.history.push(MoveEntry { uci: mv.to_string(), san });
+        self.history.push(MoveEntry { uci: mv.to_string(), san, from_book });
         self.board.make_move(mv);
         self.refresh_status();
     }
@@ -184,7 +184,7 @@ fn pt_str(pt: PieceType) -> String {
 // ── Serde types ───────────────────────────────────────────────────────────────
 
 #[derive(Serialize, Clone)]
-struct MoveEntry { uci: String, san: String }
+struct MoveEntry { uci: String, san: String, from_book: bool }
 
 #[derive(Serialize)]
 struct PieceInfo { color: String, piece_type: String }
@@ -265,7 +265,7 @@ async fn api_move(State(g): State<Shared>, Json(req): Json<MoveReq>) -> Json<Gam
             }
     }).copied();
 
-    if let Some(mv) = mv { game.apply(mv); }
+    if let Some(mv) = mv { game.apply(mv, false); }
     Json(game.to_response())
 }
 
@@ -275,7 +275,10 @@ async fn api_engine_move(State(g): State<Shared>) -> Json<GameState> {
         return Json(game.to_response());
     }
     let board = game.board.clone();
-    if let Some(mv) = game.engine.choose_move(&board) { game.apply(mv); }
+    if let Some(mv) = game.engine.choose_move(&board) {
+        let from_book = game.engine.last_was_book();
+        game.apply(mv, from_book);
+    }
     Json(game.to_response())
 }
 

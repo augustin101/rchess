@@ -408,11 +408,12 @@ fn decode_move(board: &Board, poly: u16) -> Option<Move> {
 ///   1–99 → weighted random where higher values flatten the distribution
 ///   100 → uniform random among all book moves for the position
 pub struct BookEngine<E: Engine> {
-    book:       OpeningBook,
-    inner:      E,
-    randomness: u8,
-    rng:        Xorshift64,
-    name:       String,
+    book:          OpeningBook,
+    inner:         E,
+    randomness:    u8,
+    rng:           Xorshift64,
+    name:          String,
+    last_was_book: bool,
 }
 
 impl<E: Engine> BookEngine<E> {
@@ -422,7 +423,7 @@ impl<E: Engine> BookEngine<E> {
             .duration_since(std::time::SystemTime::UNIX_EPOCH)
             .map(|d| d.subsec_nanos() as u64 ^ (d.as_secs() << 17))
             .unwrap_or(0xc0ffee_b007);
-        BookEngine { book, inner, randomness: randomness.min(100), rng: Xorshift64::new(seed), name }
+        BookEngine { book, inner, randomness: randomness.min(100), rng: Xorshift64::new(seed), name, last_was_book: false }
     }
 
     /// Convenience: wrap `inner` with the bundled book and a given randomness.
@@ -435,8 +436,10 @@ impl<E: Engine> Engine for BookEngine<E> {
     fn choose_move(&mut self, board: &Board) -> Option<Move> {
         let candidates = self.book.candidates(board);
         if candidates.is_empty() {
+            self.last_was_book = false;
             return self.inner.choose_move(board);
         }
+        self.last_was_book = true;
         Some(if self.randomness == 0 {
             candidates.iter().max_by_key(|(_, w)| *w).unwrap().0
         } else {
@@ -445,6 +448,8 @@ impl<E: Engine> Engine for BookEngine<E> {
     }
 
     fn name(&self) -> &str { &self.name }
+
+    fn last_was_book(&self) -> bool { self.last_was_book }
 }
 
 /// Pick a move using weighted probability.

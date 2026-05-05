@@ -12,4 +12,8 @@ pub trait Engine {
     fn choose_move(&mut self, board: &Board) -> Option<Move>;
 
     fn name(&self) -> &str;
+
+    /// True if the most recent `choose_move` call was answered by an opening
+    /// book rather than the engine's own search.  Defaults to false.
+    fn last_was_book(&self) -> bool { false }
 }

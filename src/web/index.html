@@ -335,6 +335,8 @@ textarea::placeholder { color: var(--muted); }
 .mnum  { color: var(--muted); font-size: 0.9em; }
 .mcell { padding: 2px 4px; border-radius: 4px; color: var(--text); }
 .mcell.hi { background: rgba(124,159,228,0.22); color: var(--accent); font-weight: 600; }
+.mcell.book     { color: #c8a84b; }
+.mcell.book.hi  { color: #e8c870; background: rgba(200,168,75,0.18); }
 
 /* ── Promotion overlay ────────────────────────────────────────────────────── */
 #promo {
@@ -626,12 +628,14 @@ function render() {
     row.className = 'mrow';
     const num = document.createElement('span'); num.className = 'mnum'; num.textContent = (i/2+1) + '.';
     const wm  = document.createElement('span');
-    wm.className = 'mcell' + (i === G.history.length - 1 ? ' hi' : '');
+    const wLast = i === G.history.length - 1;
+    wm.className = 'mcell' + (G.history[i].from_book ? ' book' : '') + (wLast ? ' hi' : '');
     wm.textContent = G.history[i].san;
     row.append(num, wm);
     if (i + 1 < G.history.length) {
       const bm = document.createElement('span');
-      bm.className = 'mcell' + (i + 1 === G.history.length - 1 ? ' hi' : '');
+      const bLast = i + 1 === G.history.length - 1;
+      bm.className = 'mcell' + (G.history[i+1].from_book ? ' book' : '') + (bLast ? ' hi' : '');
       bm.textContent = G.history[i + 1].san;
       row.appendChild(bm);
     }
