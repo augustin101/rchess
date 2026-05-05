@@ -1,6 +1,7 @@
 use crate::core::board::Board;
 use crate::core::moves::Move;
 
+pub mod alpha_beta;
 pub mod eval;
 pub mod random;
 
