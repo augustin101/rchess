@@ -6,3 +6,4 @@ pub mod moves;
 pub mod perft;
 pub mod san;
 pub mod types;
+pub mod zobrist;

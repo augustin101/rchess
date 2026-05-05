@@ -1,10 +1,11 @@
 use crate::core::board::Board;
 use crate::core::movegen::generate_legal;
 use crate::core::moves::Move;
+use crate::utils::Xorshift64;
 use super::Engine;
 
 pub struct RandomEngine {
-    rng: u64,
+    rng: Xorshift64,
 }
 
 impl RandomEngine {
@@ -13,29 +14,16 @@ impl RandomEngine {
             .duration_since(std::time::SystemTime::UNIX_EPOCH)
             .map(|d| d.subsec_nanos() as u64 ^ (d.as_secs() << 17))
             .unwrap_or(0xdeadbeef);
-        RandomEngine { rng: seed | 1 }
-    }
-
-    fn next_usize(&mut self) -> usize {
-        // xorshift64
-        self.rng ^= self.rng << 13;
-        self.rng ^= self.rng >> 7;
-        self.rng ^= self.rng << 17;
-        self.rng as usize
+        RandomEngine { rng: Xorshift64::new(seed) }
     }
 }
 
 impl Engine for RandomEngine {
     fn choose_move(&mut self, board: &Board) -> Option<Move> {
         let moves = generate_legal(board);
-        if moves.is_empty() {
-            return None;
-        }
-        let idx = self.next_usize() % moves.len();
-        Some(moves.as_slice()[idx])
+        if moves.is_empty() { return None; }
+        Some(moves.as_slice()[self.rng.next_usize() % moves.len()])
     }
 
-    fn name(&self) -> &str {
-        "RandomEngine"
-    }
+    fn name(&self) -> &str { "RandomEngine" }
 }

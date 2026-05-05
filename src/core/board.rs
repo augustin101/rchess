@@ -3,6 +3,7 @@ use std::fmt;
 use super::bitboard::*;
 use super::moves::{Move, MoveFlag};
 use super::types::*;
+use super::zobrist::zobrist_keys;
 
 pub const STARTING_FEN: &str =
     "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
@@ -75,6 +76,9 @@ pub struct Board {
     pub en_passant:       Option<Square>,
     pub half_move_clock:  u32,
     pub full_move_number: u32,
+
+    /// Incrementally-updated Zobrist hash of the current position.
+    pub hash: u64,
 }
 
 impl Board {
@@ -91,6 +95,7 @@ impl Board {
             en_passant:       None,
             half_move_clock:  0,
             full_move_number: 1,
+            hash:             0,
         }
     }
 
@@ -106,6 +111,7 @@ impl Board {
         set_bit(&mut self.occupancy[c],  sq);
         set_bit(&mut self.all_occupancy, sq);
         self.mailbox[sq.0 as usize] = Some(piece);
+        self.hash ^= zobrist_keys().piece_sq[c][pt][sq.0 as usize];
     }
 
     pub fn remove_piece(&mut self, sq: Square) {
@@ -114,6 +120,7 @@ impl Board {
             clear_bit(&mut self.pieces[c][pt], sq);
             clear_bit(&mut self.occupancy[c],  sq);
             clear_bit(&mut self.all_occupancy, sq);
+            self.hash ^= zobrist_keys().piece_sq[c][pt][sq.0 as usize];
         }
     }
 
@@ -213,6 +220,16 @@ impl Board {
             .parse()
             .map_err(|_| FenError::InvalidFullMoveNumber)?;
 
+        // 7. Finish Zobrist hash (pieces already XOR'd in via put_piece)
+        let keys = zobrist_keys();
+        if board.side_to_move == Color::Black {
+            board.hash ^= keys.side;
+        }
+        board.hash ^= keys.castling[board.castling_rights.0 as usize];
+        if let Some(sq) = board.en_passant {
+            board.hash ^= keys.en_passant[sq.file() as usize];
+        }
+
         Ok(board)
     }
 
@@ -283,6 +300,7 @@ pub struct IrreversibleState {
     pub en_passant:      Option<Square>,
     pub castling_rights: CastlingRights,
     pub half_move_clock: u32,
+    pub hash:            u64,
 }
 
 impl Board {
@@ -299,6 +317,7 @@ impl Board {
             en_passant:      self.en_passant,
             castling_rights: self.castling_rights,
             half_move_clock: self.half_move_clock,
+            hash:            self.hash,
         };
 
         let moving = self.piece_at(from)
@@ -308,6 +327,14 @@ impl Board {
 
         self.half_move_clock = if is_pawn || is_capture { 0 }
                                else { self.half_move_clock + 1 };
+
+        // Zobrist: remove old ep and castling contributions before the move.
+        let keys = zobrist_keys();
+        if let Some(sq) = state.en_passant {
+            self.hash ^= keys.en_passant[sq.file() as usize];
+        }
+        self.hash ^= keys.castling[state.castling_rights.0 as usize];
+
         self.en_passant = None;
 
         match mv.flag() {
@@ -349,6 +376,13 @@ impl Board {
         // Update castling rights for any king/rook move or rook capture
         self.castling_rights.0 &= CASTLING_RIGHTS_MASK[from.0 as usize]
                                 & CASTLING_RIGHTS_MASK[to.0 as usize];
+
+        // Zobrist: add new ep, castling, and flip side-to-move.
+        if let Some(sq) = self.en_passant {
+            self.hash ^= keys.en_passant[sq.file() as usize];
+        }
+        self.hash ^= keys.castling[self.castling_rights.0 as usize];
+        self.hash ^= keys.side;
 
         if us == Color::Black { self.full_move_number += 1; }
         self.side_to_move = us.flip();
@@ -398,6 +432,30 @@ impl Board {
                 self.put_piece(Piece::new(us, PieceType::Rook), rook_from);
             }
         }
+
+        // Restore pre-move hash; the put/remove calls above XOR'd piece keys
+        // that are not needed since we're restoring the saved snapshot.
+        self.hash = state.hash;
+    }
+
+    // ── Zobrist ───────────────────────────────────────────────────────────────
+
+    /// Recompute the Zobrist hash from scratch. Used to verify incremental
+    /// updates in tests; not needed in the hot path.
+    pub fn compute_hash(&self) -> u64 {
+        let keys = zobrist_keys();
+        let mut h = 0u64;
+        for sq in 0u8..64 {
+            if let Some(p) = self.mailbox[sq as usize] {
+                h ^= keys.piece_sq[p.color as usize][p.piece_type as usize][sq as usize];
+            }
+        }
+        if self.side_to_move == Color::Black { h ^= keys.side; }
+        h ^= keys.castling[self.castling_rights.0 as usize];
+        if let Some(sq) = self.en_passant {
+            h ^= keys.en_passant[sq.file() as usize];
+        }
+        h
     }
 
     // ── Attack queries ────────────────────────────────────────────────────────
@@ -558,6 +616,42 @@ mod tests {
         assert!(Board::from_fen(
             "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR x KQkq - 0 1"
         ).is_err());
+    }
+
+    #[test]
+    fn hash_matches_recomputed_from_fen() {
+        for fen in &[
+            STARTING_FEN,
+            "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1",
+            "r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1",
+            "8/8/8/8/8/8/3K4/R6R w - - 0 1",
+        ] {
+            let b = Board::from_fen(fen).unwrap();
+            assert_eq!(b.hash, b.compute_hash(), "hash mismatch for {fen}");
+        }
+    }
+
+    #[test]
+    fn hash_make_unmake_roundtrip() {
+        use super::super::moves::Move;
+        let mut b = Board::starting_position();
+        let h0 = b.hash;
+        // e2e4 — normal double pawn push (sets en-passant square)
+        let mv = Move::normal(Square::new(4, 1), Square::new(4, 3));
+        let state = b.make_move(mv);
+        assert_ne!(b.hash, h0, "hash must change after make_move");
+        assert_eq!(b.hash, b.compute_hash(), "incremental hash diverged after make_move");
+        b.unmake_move(mv, state);
+        assert_eq!(b.hash, h0, "hash not restored after unmake_move");
+    }
+
+    #[test]
+    fn hash_different_positions_differ() {
+        let b1 = Board::from_fen(STARTING_FEN).unwrap();
+        let b2 = Board::from_fen(
+            "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1"
+        ).unwrap();
+        assert_ne!(b1.hash, b2.hash);
     }
 
     #[test]
