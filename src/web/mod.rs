@@ -13,6 +13,7 @@ use crate::core::moves::{Move, PromoKind};
 use crate::core::san::move_to_san;
 use crate::core::types::{Color, PieceType, Square};
 use crate::engine::random::RandomEngine;
+use crate::engine::alpha_beta::AlphaBetaEngine;
 use crate::engine::Engine;
 
 // ── Game state ────────────────────────────────────────────────────────────────
@@ -36,13 +37,18 @@ struct Game {
 
 impl Game {
     fn new(human_color: Color) -> Self {
+        Self::with_engine(human_color, Box::new(RandomEngine::new()))
+    }
+
+    /// Creates a new game with a custom engine
+    fn with_engine(human_color: Color, engine: Box<dyn Engine + Send>) -> Self {
         Game {
             board:       Board::starting_position(),
             history:     Vec::new(),
             last_move:   None,
             status:      Status::Playing,
             human_color,
-            engine:      Box::new(RandomEngine::new()),
+            engine,
         }
     }
 
@@ -143,7 +149,7 @@ struct GameState {
 struct MoveReq { from: u8, to: u8, promo: Option<String> }
 
 #[derive(Deserialize)]
-struct RestartReq { human_color: Option<String> }
+struct RestartReq { human_color: Option<String>, engine: Option<String> }
 
 // ── Handlers ──────────────────────────────────────────────────────────────────
 
@@ -198,7 +204,12 @@ async fn api_restart(State(g): State<Shared>, Json(req): Json<RestartReq>) -> Js
         Some("black") => Color::Black,
         _             => Color::White,
     };
-    *g.lock().unwrap() = Game::new(color);
+    let engine = match req.engine.as_deref() {
+        Some("random") => Box::new(RandomEngine::new()) as Box<dyn Engine + Send>,
+        _                 => Box::new(AlphaBetaEngine::new(4)) as Box<dyn Engine + Send>,   
+    };
+
+    *g.lock().unwrap() = Game::with_engine(color, engine);
     Json(g.lock().unwrap().to_response())
 }
 

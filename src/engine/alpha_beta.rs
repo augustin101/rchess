@@ -10,13 +10,15 @@ const POS_INF: i32 =   CHECKMATE_SCORE + 1;
 
 pub struct AlphaBetaEngine {
     depth: u32,
+    name:  String,
 }
 
 impl AlphaBetaEngine {
     /// `depth` is the number of half-moves (plies) to search.
     /// Minimum effective depth is 1; values below that are clamped.
     pub fn new(depth: u32) -> Self {
-        AlphaBetaEngine { depth: depth.max(1) }
+        let depth = depth.max(1);
+        AlphaBetaEngine { depth, name: format!("Alpha-Beta (d={depth})") }
     }
 }
 
@@ -44,7 +46,7 @@ impl Engine for AlphaBetaEngine {
         best_move
     }
 
-    fn name(&self) -> &str { "AlphaBeta" }
+    fn name(&self) -> &str { self.name.as_str() }
 }
 
 /// Negamax with alpha-beta pruning.

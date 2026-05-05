@@ -225,7 +225,7 @@ button:disabled               { opacity: 0.35; cursor: not-allowed; }
 
   <div class="ctrl">
     <div class="lbl">Engine</div>
-    <select id="engine-sel"><option value="random">Random Engine</option></select>
+    <select id="engine-sel"><option value="random">Random Engine</option><option value="alpha-beta">Alpha-Beta Engine</option></select>
   </div>
 
   <div class="ctrl">
@@ -464,7 +464,8 @@ document.querySelectorAll('.color-btn').forEach(btn => btn.addEventListener('cli
 document.getElementById('btn-new').addEventListener('click', async () => {
   selected = null;
   const color = document.querySelector('.color-btn.active').dataset.color;
-  G = await api('/api/restart', 'POST', { human_color: color });
+  const engine = document.getElementById('engine-sel').value;
+  G = await api('/api/restart', 'POST', { human_color: color, engine: engine });
   render();
   if (G.status === 'playing' && G.side_to_move !== G.human_color)
     setTimeout(triggerEngine, 380);
