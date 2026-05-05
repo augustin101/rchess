@@ -17,6 +17,7 @@
   --dot:      rgba(0,0,0,0.22);
   --bg:       #13131f;
   --card:     #1c1c2e;
+  --card2:    #22223a;
   --border:   rgba(255,255,255,0.07);
   --text:     #d4d4e8;
   --muted:    rgba(212,212,232,0.45);
@@ -37,7 +38,7 @@ body {
   align-items: center;
   justify-content: center;
   gap: 28px;
-  padding: 24px;
+  padding: 32px 24px;
 }
 
 /* ── Board area ───────────────────────────────────────────────────────────── */
@@ -81,14 +82,12 @@ body {
 .sq.sq-last     { background: var(--lastmove) !important; }
 .sq.sq-check    { background: var(--check)    !important; }
 
-/* legal move dot */
 .sq.sq-legal::after {
   content: ''; position: absolute;
   width: 30%; height: 30%;
   background: var(--dot); border-radius: 50%;
   pointer-events: none;
 }
-/* legal capture ring */
 .sq.sq-cap::after {
   content: ''; position: absolute; inset: 0;
   border-radius: 50%;
@@ -106,20 +105,55 @@ body {
 
 /* ── Side panel ───────────────────────────────────────────────────────────── */
 #panel {
-  width: 260px;
+  width: 280px;
   background: var(--card);
   border: 1px solid var(--border);
   border-radius: 14px;
   padding: 22px 20px;
-  display: flex; flex-direction: column; gap: 18px;
+  display: flex; flex-direction: column; gap: 16px;
   box-shadow: 0 8px 32px rgba(0,0,0,0.45);
-  align-self: flex-start;
+  max-height: calc(100vh - 64px);
+  overflow-y: auto;
+  scrollbar-width: thin; scrollbar-color: rgba(255,255,255,0.08) transparent;
 }
+#panel::-webkit-scrollbar { width: 4px; }
+#panel::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); border-radius: 2px; }
+
 #panel h1 {
-  font-family: var(--font-h); font-size: 2em; letter-spacing: 1px; color: #fff;
-  border-bottom: 1px solid var(--border); padding-bottom: 14px;
+  font-family: var(--font-h); font-size: 1.9em; letter-spacing: 1px; color: #fff;
+  padding-bottom: 14px;
+  border-bottom: 1px solid var(--border);
 }
 
+/* ── Eval bar ─────────────────────────────────────────────────────────────── */
+#eval-wrap {
+  display: flex; flex-direction: column; gap: 5px;
+}
+#eval-bar {
+  width: 100%; height: 8px; border-radius: 4px;
+  background: #1a1a1a;
+  overflow: hidden;
+  position: relative;
+}
+#eval-fill {
+  height: 100%;
+  background: var(--light);
+  border-radius: 4px;
+  transition: width 0.4s ease;
+}
+#eval-row {
+  display: flex; justify-content: space-between; align-items: center;
+}
+#eval-score {
+  font-size: 0.78em; font-weight: 600; letter-spacing: 0.5px;
+  color: var(--text);
+}
+#eval-side {
+  font-size: 0.68em; letter-spacing: 1px; text-transform: uppercase;
+  color: var(--muted);
+}
+
+/* ── Status ───────────────────────────────────────────────────────────────── */
 #status {
   font-size: 0.82em; font-weight: 600;
   background: rgba(255,255,255,0.04);
@@ -132,12 +166,24 @@ body {
 #status.end     { color: #7fdf7f; border-color: rgba(127,223,127,0.3); }
 #status.wait    { color: var(--muted); }
 
+/* ── Section ──────────────────────────────────────────────────────────────── */
+.section {
+  display: flex; flex-direction: column; gap: 10px;
+  border-top: 1px solid var(--border);
+  padding-top: 14px;
+}
+.section-title {
+  font-size: 0.67em; letter-spacing: 1.8px;
+  text-transform: uppercase; color: var(--muted);
+}
+
 .lbl {
   font-size: 0.68em; letter-spacing: 1.5px;
-  text-transform: uppercase; color: var(--muted); margin-bottom: 6px;
+  text-transform: uppercase; color: var(--muted); margin-bottom: 5px;
 }
-.ctrl { display: flex; flex-direction: column; gap: 8px; }
+.ctrl { display: flex; flex-direction: column; gap: 6px; }
 
+/* ── Form controls ────────────────────────────────────────────────────────── */
 select {
   width: 100%;
   background: rgba(255,255,255,0.06);
@@ -166,9 +212,115 @@ button.danger                 { color: #e07070; border-color: rgba(200,80,80,0.3
 button.danger:hover:not(:disabled) { background: var(--danger); color: #fff; border-color: transparent; }
 button:disabled               { opacity: 0.35; cursor: not-allowed; }
 
-/* move list */
+/* ── Depth slider ─────────────────────────────────────────────────────────── */
+.slider-row {
+  display: flex; align-items: center; justify-content: space-between;
+  margin-bottom: 4px;
+}
+.slider-val {
+  font-size: 0.82em; font-weight: 600; color: var(--accent);
+  background: rgba(124,159,228,0.1); border: 1px solid rgba(124,159,228,0.2);
+  border-radius: 5px; padding: 1px 7px;
+}
+
+input[type="range"] {
+  width: 100%; height: 4px;
+  -webkit-appearance: none; appearance: none;
+  background: rgba(255,255,255,0.1);
+  border-radius: 2px; outline: none; cursor: pointer;
+}
+input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 14px; height: 14px;
+  background: var(--accent); border-radius: 50%;
+  cursor: pointer; transition: background 0.15s;
+}
+input[type="range"]::-webkit-slider-thumb:hover { background: var(--accent2); }
+input[type="range"]::-moz-range-thumb {
+  width: 14px; height: 14px;
+  background: var(--accent); border-radius: 50%;
+  border: none; cursor: pointer;
+}
+input[type="range"]:disabled {
+  opacity: 0.35; cursor: not-allowed;
+}
+input[type="range"]:disabled::-webkit-slider-thumb { cursor: not-allowed; }
+
+/* ── Coming-soon controls ─────────────────────────────────────────────────── */
+.soon-row {
+  display: flex; align-items: center; justify-content: space-between;
+  margin-bottom: 4px;
+}
+.soon-badge {
+  font-size: 0.63em; letter-spacing: 1.2px;
+  padding: 2px 6px;
+  background: rgba(124,159,228,0.1);
+  border: 1px solid rgba(124,159,228,0.25);
+  border-radius: 4px; color: var(--accent); opacity: 0.7;
+}
+.ctrl-disabled { opacity: 0.4; pointer-events: none; }
+
+/* toggle switch */
+.toggle-wrap { display: flex; align-items: center; gap: 8px; }
+.toggle {
+  position: relative; display: inline-block;
+  width: 36px; height: 20px; flex-shrink: 0;
+}
+.toggle input { opacity: 0; width: 0; height: 0; }
+.toggle-track {
+  position: absolute; inset: 0;
+  background: rgba(255,255,255,0.1); border-radius: 10px;
+  transition: background 0.2s;
+}
+.toggle input:checked + .toggle-track { background: var(--accent2); }
+.toggle-thumb {
+  position: absolute; top: 3px; left: 3px;
+  width: 14px; height: 14px;
+  background: #fff; border-radius: 50%;
+  transition: left 0.2s;
+}
+.toggle input:checked ~ .toggle-thumb { left: 19px; }
+.toggle-label { font-size: 0.8em; color: var(--muted); }
+
+/* ── FEN section ──────────────────────────────────────────────────────────── */
+textarea {
+  width: 100%; resize: none;
+  background: rgba(255,255,255,0.04);
+  border: 1px solid var(--border); border-radius: 8px;
+  color: var(--text); padding: 8px 10px;
+  font-family: var(--font-m); font-size: 0.72em; line-height: 1.5;
+  outline: none;
+  transition: border-color 0.15s;
+}
+textarea:focus { border-color: rgba(124,159,228,0.4); }
+textarea::placeholder { color: var(--muted); }
+
+#btn-copy-fen { position: relative; }
+#copy-flash {
+  position: absolute; inset: 0;
+  display: flex; align-items: center; justify-content: center;
+  background: var(--accent2); border-radius: 7px;
+  font-size: 0.78em; font-weight: 600; color: #fff;
+  opacity: 0; pointer-events: none;
+  transition: opacity 0.15s;
+}
+#copy-flash.show { opacity: 1; }
+
+/* ── Moves box (left of board) ────────────────────────────────────────────── */
+#moves-box {
+  width: 192px;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 18px 16px;
+  display: flex; flex-direction: column; gap: 12px;
+  box-shadow: 0 8px 32px rgba(0,0,0,0.45);
+  height: calc(var(--sq) * 8 + 20px);
+}
+
+/* ── Move list ────────────────────────────────────────────────────────────── */
 #move-list {
-  overflow-y: auto; max-height: 280px;
+  flex: 1; overflow-y: auto;
   font-size: 0.82em;
   scrollbar-width: thin; scrollbar-color: rgba(255,255,255,0.1) transparent;
 }
@@ -211,6 +363,11 @@ button:disabled               { opacity: 0.35; cursor: not-allowed; }
 </head>
 <body>
 
+<div id="moves-box">
+  <div class="section-title">Moves</div>
+  <div id="move-list"></div>
+</div>
+
 <div id="board-wrap">
   <div id="board-outer">
     <div id="rank-labels"></div>
@@ -221,30 +378,100 @@ button:disabled               { opacity: 0.35; cursor: not-allowed; }
 
 <div id="panel">
   <h1>rchess</h1>
-  <div id="status">Loading…</div>
 
-  <div class="ctrl">
-    <div class="lbl">Engine</div>
-    <select id="engine-sel"><option value="alpha-beta">Alpha-Beta Engine</option><option value="random">Random Engine</option></select>
+  <!-- Eval bar -->
+  <div id="eval-wrap">
+    <div id="eval-bar"><div id="eval-fill" style="width:50%"></div></div>
+    <div id="eval-row">
+      <span id="eval-score">0.0</span>
+      <span id="eval-side"></span>
+    </div>
   </div>
 
-  <div class="ctrl">
-    <div class="lbl">Play as</div>
+  <!-- Status -->
+  <div id="status">Loading…</div>
+
+  <!-- Engine settings -->
+  <div class="section">
+    <div class="section-title">Engine</div>
+
+    <div class="ctrl">
+      <div class="lbl">Type</div>
+      <select id="engine-sel">
+        <option value="alpha-beta">Alpha-Beta</option>
+        <option value="random">Random</option>
+      </select>
+    </div>
+
+    <div class="ctrl" id="depth-ctrl">
+      <div class="slider-row">
+        <span class="lbl" style="margin:0">Search Depth</span>
+        <span class="slider-val" id="depth-val">5</span>
+      </div>
+      <input type="range" id="depth-range" min="1" max="8" value="5">
+    </div>
+
+    <div class="ctrl ctrl-disabled">
+      <div class="soon-row">
+        <span class="lbl" style="margin:0">Book Openings</span>
+        <span class="soon-badge">SOON</span>
+      </div>
+      <div class="toggle-wrap">
+        <label class="toggle">
+          <input type="checkbox" disabled>
+          <span class="toggle-track"></span>
+          <span class="toggle-thumb"></span>
+        </label>
+        <span class="toggle-label">Off</span>
+      </div>
+    </div>
+
+    <div class="ctrl ctrl-disabled">
+      <div class="soon-row">
+        <span class="lbl" style="margin:0">Randomness</span>
+        <span class="soon-badge">SOON</span>
+      </div>
+      <div class="slider-row" style="margin:0">
+        <span style="font-size:0.72em;color:var(--muted)">Deterministic</span>
+        <span style="font-size:0.72em;color:var(--muted)">Creative</span>
+      </div>
+      <input type="range" min="0" max="100" value="0" disabled>
+    </div>
+  </div>
+
+  <!-- Play as -->
+  <div class="section">
+    <div class="section-title">Play As</div>
     <div class="row2">
       <button class="color-btn active" data-color="white">White</button>
       <button class="color-btn"        data-color="black">Black</button>
     </div>
   </div>
 
-  <div class="ctrl">
-    <button id="btn-new"    class="primary">New Game</button>
-    <button id="btn-resign" class="danger"  disabled>Resign</button>
+  <!-- Actions -->
+  <div class="ctrl" style="gap:6px">
+    <button id="btn-new" class="primary">New Game</button>
+    <div class="row2">
+      <button id="btn-undo" disabled>Undo</button>
+      <button id="btn-resign" class="danger" disabled>Resign</button>
+    </div>
   </div>
 
-  <div>
-    <div class="lbl">Moves</div>
-    <div id="move-list"></div>
+  <!-- Position -->
+  <div class="section">
+    <div class="section-title">Position</div>
+    <div class="ctrl">
+      <textarea id="fen-input" rows="2" placeholder="Paste FEN to load a position…"></textarea>
+      <div class="row2">
+        <button id="btn-load-fen">Load FEN</button>
+        <button id="btn-copy-fen" style="position:relative">
+          Copy FEN
+          <span id="copy-flash">Copied!</span>
+        </button>
+      </div>
+    </div>
   </div>
+
 </div>
 
 <div id="promo" class="hidden">
@@ -256,8 +483,8 @@ button:disabled               { opacity: 0.35; cursor: not-allowed; }
 
 <script>
 // ── State ─────────────────────────────────────────────────────────────────────
-let G        = null;   // last GameState
-let selected = null;   // square index or null
+let G        = null;
+let selected = null;
 let promoFrom = null, promoTo = null;
 
 // ── Piece glyphs ──────────────────────────────────────────────────────────────
@@ -275,7 +502,6 @@ const idx  = (f, r) => r * 8 + f;
 function uciFrom(u) { return idx(u.charCodeAt(0) - 97, +u[1] - 1); }
 function uciTo(u)   { return idx(u.charCodeAt(2) - 97, +u[3] - 1); }
 
-// returns Map<destSq, 'move'|'capture'>
 function legalDests(fromSq) {
   const m = new Map();
   for (const u of G.legal_moves)
@@ -289,6 +515,31 @@ async function api(url, method = 'GET', body) {
   const o = { method, headers: { 'Content-Type': 'application/json' } };
   if (body !== undefined) o.body = JSON.stringify(body);
   return (await fetch(url, o)).json();
+}
+
+// ── Eval helpers ──────────────────────────────────────────────────────────────
+function evalPercent(evalCp) {
+  if (evalCp >=  30000) return 100;
+  if (evalCp <= -30000) return 0;
+  const pawns = evalCp / 100;
+  return Math.min(100, Math.max(0, 50 + pawns * 4));
+}
+
+function evalText(gs) {
+  if (gs.status === 'checkmate') {
+    return gs.winner === 'white' ? 'M' : '-M';
+  }
+  if (gs.status === 'stalemate') return '0.0';
+  const pawns = gs.eval / 100;
+  const sign = pawns > 0 ? '+' : '';
+  return sign + pawns.toFixed(1);
+}
+
+function evalSideText(gs) {
+  if (gs.status !== 'playing') return '';
+  if (gs.eval > 50)  return 'White better';
+  if (gs.eval < -50) return 'Black better';
+  return 'Equal';
 }
 
 // ── Render ────────────────────────────────────────────────────────────────────
@@ -364,6 +615,12 @@ function render() {
   else if (G.status === 'stalemate')   { st.textContent = 'Stalemate — draw!';                   st.classList.add('end'); }
   else if (G.status === 'resigned')    { st.textContent = `Resigned — ${cap(G.winner)} wins!`;   st.classList.add('end'); }
 
+  // Eval bar
+  const pct = evalPercent(G.eval);
+  document.getElementById('eval-fill').style.width = pct + '%';
+  document.getElementById('eval-score').textContent = evalText(G);
+  document.getElementById('eval-side').textContent  = evalSideText(G);
+
   // Move history
   const ml = document.getElementById('move-list');
   ml.innerHTML = '';
@@ -385,8 +642,28 @@ function render() {
   }
   ml.scrollTop = ml.scrollHeight;
 
+  // FEN input (only update if not focused)
+  const fenInput = document.getElementById('fen-input');
+  if (document.activeElement !== fenInput) fenInput.value = G.fen;
+
+  // Depth control visibility
+  const isRandom = G.engine_type === 'random';
+  document.getElementById('depth-ctrl').style.opacity = isRandom ? '0.35' : '1';
+  document.getElementById('depth-ctrl').style.pointerEvents = isRandom ? 'none' : '';
+
+  // Sync depth slider to current game depth
+  const depthRange = document.getElementById('depth-range');
+  if (depthRange.value != G.depth) {
+    depthRange.value = G.depth;
+    document.getElementById('depth-val').textContent = G.depth;
+  }
+
+  // Sync engine selector
+  document.getElementById('engine-sel').value = G.engine_type;
+
   // Buttons
   document.getElementById('btn-resign').disabled = G.status !== 'playing';
+  document.getElementById('btn-undo').disabled   = G.history.length === 0;
 }
 
 // ── Click handling ────────────────────────────────────────────────────────────
@@ -465,11 +742,22 @@ document.querySelectorAll('.color-btn').forEach(btn => btn.addEventListener('cli
   btn.classList.add('active');
 }));
 
+// Depth slider live label
+document.getElementById('depth-range').addEventListener('input', e => {
+  document.getElementById('depth-val').textContent = e.target.value;
+});
+
+function getSettings() {
+  return {
+    human_color: document.querySelector('.color-btn.active').dataset.color,
+    engine:      document.getElementById('engine-sel').value,
+    depth:       parseInt(document.getElementById('depth-range').value, 10),
+  };
+}
+
 document.getElementById('btn-new').addEventListener('click', async () => {
   selected = null;
-  const color = document.querySelector('.color-btn.active').dataset.color;
-  const engine = document.getElementById('engine-sel').value;
-  G = await api('/api/restart', 'POST', { human_color: color, engine: engine });
+  G = await api('/api/restart', 'POST', getSettings());
   render();
   checkTriggerEngine();
 });
@@ -478,6 +766,30 @@ document.getElementById('btn-resign').addEventListener('click', async () => {
   if (G.status !== 'playing') return;
   G = await api('/api/resign', 'POST');
   render();
+});
+
+document.getElementById('btn-undo').addEventListener('click', async () => {
+  selected = null;
+  G = await api('/api/undo', 'POST');
+  render();
+});
+
+document.getElementById('btn-load-fen').addEventListener('click', async () => {
+  const fen = document.getElementById('fen-input').value.trim();
+  if (!fen) return;
+  selected = null;
+  G = await api('/api/load-fen', 'POST', { fen, ...getSettings() });
+  render();
+  checkTriggerEngine();
+});
+
+document.getElementById('btn-copy-fen').addEventListener('click', () => {
+  const fen = G ? G.fen : document.getElementById('fen-input').value;
+  navigator.clipboard.writeText(fen).then(() => {
+    const flash = document.getElementById('copy-flash');
+    flash.classList.add('show');
+    setTimeout(() => flash.classList.remove('show'), 900);
+  });
 });
 
 // ── Boot ──────────────────────────────────────────────────────────────────────

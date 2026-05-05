@@ -12,6 +12,7 @@ use crate::core::movegen::generate_legal;
 use crate::core::moves::{Move, PromoKind};
 use crate::core::san::move_to_san;
 use crate::core::types::{Color, PieceType, Square};
+use crate::engine::eval::{static_eval, CHECKMATE_SCORE};
 use crate::engine::random::RandomEngine;
 use crate::engine::alpha_beta::AlphaBetaEngine;
 use crate::engine::Engine;
@@ -27,37 +28,71 @@ enum Status {
 }
 
 struct Game {
-    board:       Board,
-    history:     Vec<MoveEntry>,
-    last_move:   Option<(u8, u8)>,
-    status:      Status,
-    human_color: Color,
-    engine:      Box<dyn Engine + Send>,
+    board:         Board,
+    history:       Vec<MoveEntry>,
+    board_history: Vec<Board>,
+    last_move:     Option<(u8, u8)>,
+    status:        Status,
+    human_color:   Color,
+    engine:        Box<dyn Engine + Send>,
+    engine_type:   String,
+    depth:         u32,
+}
+
+fn make_engine(engine_type: &str, depth: u32) -> Box<dyn Engine + Send> {
+    match engine_type {
+        "random" => Box::new(RandomEngine::new()) as Box<dyn Engine + Send>,
+        _        => Box::new(AlphaBetaEngine::with_depth(depth)) as Box<dyn Engine + Send>,
+    }
 }
 
 impl Game {
     fn new(human_color: Color) -> Self {
-        Self::with_engine(human_color, Box::new(AlphaBetaEngine::new()))
+        Self::from_board(human_color, "alpha-beta", 5, Board::starting_position())
     }
 
-    /// Creates a new game with a custom engine
-    fn with_engine(human_color: Color, engine: Box<dyn Engine + Send>) -> Self {
-        Game {
-            board:       Board::starting_position(),
-            history:     Vec::new(),
-            last_move:   None,
-            status:      Status::Playing,
+    fn from_board(human_color: Color, engine_type: &str, depth: u32, board: Board) -> Self {
+        let mut game = Game {
+            board,
+            history:       Vec::new(),
+            board_history: Vec::new(),
+            last_move:     None,
+            status:        Status::Playing,
             human_color,
-            engine,
-        }
+            engine:        make_engine(engine_type, depth),
+            engine_type:   engine_type.to_string(),
+            depth,
+        };
+        game.refresh_status();
+        game
     }
 
     fn apply(&mut self, mv: Move) {
+        self.board_history.push(self.board.clone());
         let san = move_to_san(&self.board, mv);
         self.last_move = Some((mv.from_sq().0, mv.to_sq().0));
         self.history.push(MoveEntry { uci: mv.to_string(), san });
         self.board.make_move(mv);
         self.refresh_status();
+    }
+
+    fn undo(&mut self) {
+        if self.board_history.is_empty() { return; }
+        // Undo 2 plies (engine + human); 1 ply if only 1 available.
+        let plies = if self.board_history.len() >= 2 { 2 } else { 1 };
+        for _ in 0..plies {
+            if let Some(board) = self.board_history.pop() {
+                self.board = board;
+                self.history.pop();
+            }
+        }
+        self.last_move = self.history.last().map(|e| {
+            let b = e.uci.as_bytes();
+            let from = (b[1] - b'1') * 8 + (b[0] - b'a');
+            let to   = (b[3] - b'1') * 8 + (b[2] - b'a');
+            (from, to)
+        });
+        self.status = Status::Playing;
     }
 
     fn refresh_status(&mut self) {
@@ -69,6 +104,15 @@ impl Game {
             } else {
                 Status::Stalemate
             };
+        }
+    }
+
+    fn eval(&self) -> i32 {
+        match &self.status {
+            Status::Checkmate { winner } => if *winner == Color::White { CHECKMATE_SCORE } else { -CHECKMATE_SCORE },
+            Status::Stalemate            => 0,
+            Status::Resigned  { loser }  => if *loser == Color::White  { -CHECKMATE_SCORE } else { CHECKMATE_SCORE },
+            Status::Playing              => static_eval(&self.board),
         }
     }
 
@@ -104,6 +148,10 @@ impl Game {
             human_color:  color_str(self.human_color),
             last_move:    self.last_move,
             engine_name:  self.engine.name().to_string(),
+            engine_type:  self.engine_type.clone(),
+            depth:        self.depth,
+            eval:         self.eval(),
+            fen:          self.board.to_fen(),
         }
     }
 }
@@ -143,13 +191,29 @@ struct GameState {
     human_color:  String,
     last_move:    Option<(u8, u8)>,
     engine_name:  String,
+    engine_type:  String,
+    depth:        u32,
+    eval:         i32,
+    fen:          String,
 }
 
 #[derive(Deserialize)]
 struct MoveReq { from: u8, to: u8, promo: Option<String> }
 
 #[derive(Deserialize)]
-struct RestartReq { human_color: Option<String>, engine: Option<String> }
+struct RestartReq {
+    human_color: Option<String>,
+    engine:      Option<String>,
+    depth:       Option<u32>,
+}
+
+#[derive(Deserialize)]
+struct LoadFenReq {
+    fen:         String,
+    human_color: Option<String>,
+    engine:      Option<String>,
+    depth:       Option<u32>,
+}
 
 // ── Handlers ──────────────────────────────────────────────────────────────────
 
@@ -199,18 +263,42 @@ async fn api_engine_move(State(g): State<Shared>) -> Json<GameState> {
     Json(game.to_response())
 }
 
-async fn api_restart(State(g): State<Shared>, Json(req): Json<RestartReq>) -> Json<GameState> {
-    let color = match req.human_color.as_deref() {
-        Some("black") => Color::Black,
-        _             => Color::White,
-    };
-    let engine = match req.engine.as_deref() {
-        Some("random") => Box::new(RandomEngine::new()) as Box<dyn Engine + Send>,
-        _                 => Box::new(AlphaBetaEngine::new()) as Box<dyn Engine + Send>,   
-    };
+fn parse_color(s: Option<&str>) -> Color {
+    match s { Some("black") => Color::Black, _ => Color::White }
+}
 
-    *g.lock().unwrap() = Game::with_engine(color, engine);
-    Json(g.lock().unwrap().to_response())
+fn parse_engine_type(s: Option<&str>) -> &'static str {
+    match s { Some("random") => "random", _ => "alpha-beta" }
+}
+
+fn parse_depth(d: Option<u32>) -> u32 {
+    d.unwrap_or(5).clamp(1, 8)
+}
+
+async fn api_restart(State(g): State<Shared>, Json(req): Json<RestartReq>) -> Json<GameState> {
+    let color       = parse_color(req.human_color.as_deref());
+    let engine_type = parse_engine_type(req.engine.as_deref());
+    let depth       = parse_depth(req.depth);
+    let mut game    = g.lock().unwrap();
+    *game = Game::from_board(color, engine_type, depth, Board::starting_position());
+    Json(game.to_response())
+}
+
+async fn api_load_fen(State(g): State<Shared>, Json(req): Json<LoadFenReq>) -> Json<GameState> {
+    let color       = parse_color(req.human_color.as_deref());
+    let engine_type = parse_engine_type(req.engine.as_deref());
+    let depth       = parse_depth(req.depth);
+    let mut game    = g.lock().unwrap();
+    if let Ok(board) = Board::from_fen(&req.fen) {
+        *game = Game::from_board(color, engine_type, depth, board);
+    }
+    Json(game.to_response())
+}
+
+async fn api_undo(State(g): State<Shared>) -> Json<GameState> {
+    let mut game = g.lock().unwrap();
+    game.undo();
+    Json(game.to_response())
 }
 
 async fn api_resign(State(g): State<Shared>) -> Json<GameState> {
@@ -231,6 +319,8 @@ pub fn router() -> Router {
         .route("/api/move",        post(api_move))
         .route("/api/engine-move", post(api_engine_move))
         .route("/api/restart",     post(api_restart))
+        .route("/api/load-fen",    post(api_load_fen))
+        .route("/api/undo",        post(api_undo))
         .route("/api/resign",      post(api_resign))
         .with_state(state)
 }
