@@ -225,7 +225,7 @@ button:disabled               { opacity: 0.35; cursor: not-allowed; }
 
   <div class="ctrl">
     <div class="lbl">Engine</div>
-    <select id="engine-sel"><option value="random">Random Engine</option><option value="alpha-beta">Alpha-Beta Engine</option></select>
+    <select id="engine-sel"><option value="alpha-beta">Alpha-Beta Engine</option><option value="random">Random Engine</option></select>
   </div>
 
   <div class="ctrl">
@@ -420,13 +420,17 @@ async function submitMove(from, to, promo) {
   selected = null;
   G = await api('/api/move', 'POST', { from, to, promo });
   render();
-  if (G.status === 'playing' && G.side_to_move !== G.human_color)
-    setTimeout(triggerEngine, 380);
+  checkTriggerEngine();
 }
 
 async function triggerEngine() {
   G = await api('/api/engine-move', 'POST');
   render();
+}
+
+async function checkTriggerEngine() {
+  if (G.status === 'playing' && G.side_to_move !== G.human_color)
+    setTimeout(triggerEngine, 380);
 }
 
 // ── Promotion dialog ──────────────────────────────────────────────────────────
@@ -467,8 +471,7 @@ document.getElementById('btn-new').addEventListener('click', async () => {
   const engine = document.getElementById('engine-sel').value;
   G = await api('/api/restart', 'POST', { human_color: color, engine: engine });
   render();
-  if (G.status === 'playing' && G.side_to_move !== G.human_color)
-    setTimeout(triggerEngine, 380);
+  checkTriggerEngine();
 });
 
 document.getElementById('btn-resign').addEventListener('click', async () => {
@@ -481,8 +484,7 @@ document.getElementById('btn-resign').addEventListener('click', async () => {
 (async () => {
   G = await api('/api/state');
   render();
-  if (G.status === 'playing' && G.side_to_move !== G.human_color)
-    setTimeout(triggerEngine, 300);
+  checkTriggerEngine();
 })();
 </script>
 </body>

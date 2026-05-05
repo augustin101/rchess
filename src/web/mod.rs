@@ -37,7 +37,7 @@ struct Game {
 
 impl Game {
     fn new(human_color: Color) -> Self {
-        Self::with_engine(human_color, Box::new(RandomEngine::new()))
+        Self::with_engine(human_color, Box::new(AlphaBetaEngine::new()))
     }
 
     /// Creates a new game with a custom engine
@@ -206,7 +206,7 @@ async fn api_restart(State(g): State<Shared>, Json(req): Json<RestartReq>) -> Js
     };
     let engine = match req.engine.as_deref() {
         Some("random") => Box::new(RandomEngine::new()) as Box<dyn Engine + Send>,
-        _                 => Box::new(AlphaBetaEngine::new(4)) as Box<dyn Engine + Send>,   
+        _                 => Box::new(AlphaBetaEngine::new()) as Box<dyn Engine + Send>,   
     };
 
     *g.lock().unwrap() = Game::with_engine(color, engine);

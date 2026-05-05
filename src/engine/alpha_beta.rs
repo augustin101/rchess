@@ -14,9 +14,11 @@ pub struct AlphaBetaEngine {
 }
 
 impl AlphaBetaEngine {
-    /// `depth` is the number of half-moves (plies) to search.
-    /// Minimum effective depth is 1; values below that are clamped.
-    pub fn new(depth: u32) -> Self {
+    pub fn new() -> Self {
+        let default = 5;
+        Self::with_depth(default)
+    }
+    pub fn with_depth(depth: u32) -> Self { 
         let depth = depth.max(1);
         AlphaBetaEngine { depth, name: format!("Alpha-Beta (d={depth})") }
     }
@@ -101,7 +103,7 @@ mod tests {
     #[test]
     fn returns_a_move_from_starting_position() {
         let b = Board::starting_position();
-        let mut engine = AlphaBetaEngine::new(3);
+        let mut engine = AlphaBetaEngine::new();
         assert!(engine.choose_move(&b).is_some());
     }
 
@@ -109,7 +111,7 @@ mod tests {
     fn returns_none_when_already_mated() {
         // Fool's mate: it is White's turn and they are mated.
         let b = board("rnb1kbnr/pppp1ppp/8/4p3/6Pq/5P2/PPPPP2P/RNBQKBNR w KQkq - 1 3");
-        let mut engine = AlphaBetaEngine::new(3);
+        let mut engine = AlphaBetaEngine::new();
         assert!(engine.choose_move(&b).is_none());
     }
 
@@ -119,7 +121,7 @@ mod tests {
         // Depth 2 is required: the search must see the reply position
         // (White in check with no moves) one level below the leaf.
         let b = board("rnbqkbnr/pppp1ppp/8/4p3/6P1/5P2/PPPPP2P/RNBQKBNR b KQkq g3 0 2");
-        let mut engine = AlphaBetaEngine::new(2);
+        let mut engine = AlphaBetaEngine::with_depth(2);
         let mv = engine.choose_move(&b).expect("engine must return a move");
 
         let mut b2 = b.clone();
