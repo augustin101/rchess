@@ -3,6 +3,7 @@ use crate::core::moves::Move;
 
 pub mod alpha_beta;
 pub mod eval;
+pub mod opening_book;
 pub mod random;
 
 pub trait Engine {
