@@ -1,0 +1,488 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>rchess</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Playfair+Display:wght@700&family=JetBrains+Mono:wght@400;600&display=swap');
+
+:root {
+  --sq:       72px;
+  --light:    #f0d9b5;
+  --dark:     #b58863;
+  --sel:      rgba(20,160,40,0.55);
+  --lastmove: rgba(205,210,20,0.38);
+  --check:    rgba(210,30,30,0.55);
+  --dot:      rgba(0,0,0,0.22);
+  --bg:       #13131f;
+  --card:     #1c1c2e;
+  --border:   rgba(255,255,255,0.07);
+  --text:     #d4d4e8;
+  --muted:    rgba(212,212,232,0.45);
+  --accent:   #7c9fe4;
+  --accent2:  #5a7fcf;
+  --danger:   rgba(200,70,70,0.75);
+  --font-h:   'Playfair Display', Georgia, serif;
+  --font-m:   'JetBrains Mono', 'Courier New', monospace;
+}
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-m);
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 28px;
+  padding: 24px;
+}
+
+/* ── Board area ───────────────────────────────────────────────────────────── */
+#board-wrap { display: flex; flex-direction: column; align-items: center; user-select: none; }
+#board-outer { display: flex; align-items: stretch; }
+
+#rank-labels {
+  display: flex; flex-direction: column;
+  width: 20px; height: calc(var(--sq) * 8);
+}
+#rank-labels span {
+  flex: 1; display: flex; align-items: center; justify-content: center;
+  font-size: 11px; color: var(--muted); font-weight: 600;
+}
+#file-labels { display: flex; padding-left: 20px; height: 20px; }
+#file-labels span {
+  width: var(--sq); text-align: center;
+  font-size: 11px; color: var(--muted); font-weight: 600;
+}
+
+#board {
+  display: grid;
+  grid-template-columns: repeat(8, var(--sq));
+  grid-template-rows:    repeat(8, var(--sq));
+  box-shadow: 0 16px 60px rgba(0,0,0,0.7), 0 0 0 2px rgba(255,255,255,0.06);
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.sq {
+  width: var(--sq); height: var(--sq);
+  position: relative;
+  display: flex; align-items: center; justify-content: center;
+  cursor: pointer;
+  transition: filter 0.08s;
+}
+.sq:hover { filter: brightness(1.08); }
+.sq.light { background: var(--light); }
+.sq.dark  { background: var(--dark); }
+.sq.sq-sel      { background: var(--sel)      !important; }
+.sq.sq-last     { background: var(--lastmove) !important; }
+.sq.sq-check    { background: var(--check)    !important; }
+
+/* legal move dot */
+.sq.sq-legal::after {
+  content: ''; position: absolute;
+  width: 30%; height: 30%;
+  background: var(--dot); border-radius: 50%;
+  pointer-events: none;
+}
+/* legal capture ring */
+.sq.sq-cap::after {
+  content: ''; position: absolute; inset: 0;
+  border-radius: 50%;
+  box-shadow: inset 0 0 0 5px var(--dot);
+  pointer-events: none;
+}
+
+.piece {
+  font-size: 50px; line-height: 1;
+  pointer-events: none; z-index: 1;
+  filter: drop-shadow(0 1px 2px rgba(0,0,0,0.4));
+}
+.piece.white { color: #fff;    text-shadow: 0 0 3px rgba(0,0,0,0.55); }
+.piece.black { color: #1a1a1a; text-shadow: 0 0 2px rgba(255,255,255,0.1); }
+
+/* ── Side panel ───────────────────────────────────────────────────────────── */
+#panel {
+  width: 260px;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 22px 20px;
+  display: flex; flex-direction: column; gap: 18px;
+  box-shadow: 0 8px 32px rgba(0,0,0,0.45);
+  align-self: flex-start;
+}
+#panel h1 {
+  font-family: var(--font-h); font-size: 2em; letter-spacing: 1px; color: #fff;
+  border-bottom: 1px solid var(--border); padding-bottom: 14px;
+}
+
+#status {
+  font-size: 0.82em; font-weight: 600;
+  background: rgba(255,255,255,0.04);
+  border: 1px solid var(--border); border-radius: 8px;
+  padding: 10px 12px; min-height: 40px;
+  display: flex; align-items: center; letter-spacing: 0.3px;
+  transition: color 0.25s, border-color 0.25s;
+}
+#status.check   { color: #ffa040; border-color: rgba(255,160,64,0.3); }
+#status.end     { color: #7fdf7f; border-color: rgba(127,223,127,0.3); }
+#status.wait    { color: var(--muted); }
+
+.lbl {
+  font-size: 0.68em; letter-spacing: 1.5px;
+  text-transform: uppercase; color: var(--muted); margin-bottom: 6px;
+}
+.ctrl { display: flex; flex-direction: column; gap: 8px; }
+
+select {
+  width: 100%;
+  background: rgba(255,255,255,0.06);
+  border: 1px solid var(--border); color: var(--text);
+  padding: 8px 10px; border-radius: 8px;
+  font-family: var(--font-m); font-size: 0.82em;
+  cursor: pointer; outline: none; appearance: none;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%23888'/%3E%3C/svg%3E");
+  background-repeat: no-repeat; background-position: right 10px center;
+}
+
+.row2 { display: flex; gap: 6px; }
+
+button {
+  flex: 1; padding: 8px 6px;
+  border: 1px solid var(--border); border-radius: 8px;
+  font-family: var(--font-m); font-size: 0.82em; font-weight: 600;
+  cursor: pointer; background: rgba(255,255,255,0.05); color: var(--muted);
+  transition: background 0.15s, color 0.15s, border-color 0.15s;
+  letter-spacing: 0.3px;
+}
+button.active, button.primary { background: var(--accent2); border-color: var(--accent); color: #fff; }
+button.primary:hover          { background: var(--accent); }
+button:not(.active):not(.primary):hover { background: rgba(255,255,255,0.09); color: var(--text); }
+button.danger                 { color: #e07070; border-color: rgba(200,80,80,0.3); }
+button.danger:hover:not(:disabled) { background: var(--danger); color: #fff; border-color: transparent; }
+button:disabled               { opacity: 0.35; cursor: not-allowed; }
+
+/* move list */
+#move-list {
+  overflow-y: auto; max-height: 280px;
+  font-size: 0.82em;
+  scrollbar-width: thin; scrollbar-color: rgba(255,255,255,0.1) transparent;
+}
+#move-list::-webkit-scrollbar { width: 4px; }
+#move-list::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.12); border-radius: 2px; }
+
+.mrow {
+  display: grid; grid-template-columns: 28px 1fr 1fr;
+  padding: 3px 4px; border-radius: 5px;
+}
+.mrow:nth-child(even) { background: rgba(255,255,255,0.025); }
+.mnum  { color: var(--muted); font-size: 0.9em; }
+.mcell { padding: 2px 4px; border-radius: 4px; color: var(--text); }
+.mcell.hi { background: rgba(124,159,228,0.22); color: var(--accent); font-weight: 600; }
+
+/* ── Promotion overlay ────────────────────────────────────────────────────── */
+#promo {
+  position: fixed; inset: 0;
+  background: rgba(0,0,0,0.75); backdrop-filter: blur(3px);
+  display: flex; align-items: center; justify-content: center;
+  z-index: 200;
+}
+#promo.hidden { display: none; }
+#promo-box {
+  background: var(--card); border: 1px solid var(--border); border-radius: 14px;
+  padding: 20px 24px; display: flex; flex-direction: column; align-items: center; gap: 14px;
+  box-shadow: 0 20px 60px rgba(0,0,0,0.7);
+}
+#promo-box p { font-size: 0.82em; color: var(--muted); letter-spacing: 0.5px; }
+#promo-pieces { display: flex; gap: 10px; }
+.pb {
+  width: 76px; height: 76px;
+  background: rgba(255,255,255,0.06); border: 1px solid var(--border); border-radius: 10px;
+  font-size: 48px; display: flex; align-items: center; justify-content: center;
+  cursor: pointer; color: var(--text);
+  transition: background 0.15s, border-color 0.15s;
+}
+.pb:hover { background: var(--accent2); border-color: var(--accent); }
+</style>
+</head>
+<body>
+
+<div id="board-wrap">
+  <div id="board-outer">
+    <div id="rank-labels"></div>
+    <div id="board"></div>
+  </div>
+  <div id="file-labels"></div>
+</div>
+
+<div id="panel">
+  <h1>rchess</h1>
+  <div id="status">Loading…</div>
+
+  <div class="ctrl">
+    <div class="lbl">Engine</div>
+    <select id="engine-sel"><option value="random">Random Engine</option></select>
+  </div>
+
+  <div class="ctrl">
+    <div class="lbl">Play as</div>
+    <div class="row2">
+      <button class="color-btn active" data-color="white">White</button>
+      <button class="color-btn"        data-color="black">Black</button>
+    </div>
+  </div>
+
+  <div class="ctrl">
+    <button id="btn-new"    class="primary">New Game</button>
+    <button id="btn-resign" class="danger"  disabled>Resign</button>
+  </div>
+
+  <div>
+    <div class="lbl">Moves</div>
+    <div id="move-list"></div>
+  </div>
+</div>
+
+<div id="promo" class="hidden">
+  <div id="promo-box">
+    <p>PROMOTE TO</p>
+    <div id="promo-pieces"></div>
+  </div>
+</div>
+
+<script>
+// ── State ─────────────────────────────────────────────────────────────────────
+let G        = null;   // last GameState
+let selected = null;   // square index or null
+let promoFrom = null, promoTo = null;
+
+// ── Piece glyphs ──────────────────────────────────────────────────────────────
+const GLYPH = {
+  white: { king:'♔', queen:'♕', rook:'♖', bishop:'♗', knight:'♘', pawn:'♙' },
+  black: { king:'♚', queen:'♛', rook:'♜', bishop:'♝', knight:'♞', pawn:'♟' },
+};
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+const cap  = s  => s ? s[0].toUpperCase() + s.slice(1) : '';
+const file = sq => sq % 8;
+const rank = sq => Math.floor(sq / 8);
+const idx  = (f, r) => r * 8 + f;
+
+function uciFrom(u) { return idx(u.charCodeAt(0) - 97, +u[1] - 1); }
+function uciTo(u)   { return idx(u.charCodeAt(2) - 97, +u[3] - 1); }
+
+// returns Map<destSq, 'move'|'capture'>
+function legalDests(fromSq) {
+  const m = new Map();
+  for (const u of G.legal_moves)
+    if (uciFrom(u) === fromSq)
+      m.set(uciTo(u), G.board[uciTo(u)] ? 'capture' : 'move');
+  return m;
+}
+
+// ── API ───────────────────────────────────────────────────────────────────────
+async function api(url, method = 'GET', body) {
+  const o = { method, headers: { 'Content-Type': 'application/json' } };
+  if (body !== undefined) o.body = JSON.stringify(body);
+  return (await fetch(url, o)).json();
+}
+
+// ── Render ────────────────────────────────────────────────────────────────────
+function render() {
+  const flipped = G.human_color === 'black';
+
+  // Rank labels
+  const rl = document.getElementById('rank-labels');
+  rl.innerHTML = '';
+  for (let r = 0; r < 8; r++) {
+    const s = document.createElement('span');
+    s.textContent = flipped ? r + 1 : 8 - r;
+    rl.appendChild(s);
+  }
+
+  // File labels
+  const fl = document.getElementById('file-labels');
+  fl.innerHTML = '';
+  for (let f = 0; f < 8; f++) {
+    const s = document.createElement('span');
+    s.textContent = 'abcdefgh'[flipped ? 7 - f : f];
+    fl.appendChild(s);
+  }
+
+  // Board
+  const dests = selected !== null && G.status === 'playing' ? legalDests(selected) : new Map();
+  let checkSq = -1;
+  if (G.in_check && G.status === 'playing') {
+    for (let i = 0; i < 64; i++) {
+      const p = G.board[i];
+      if (p && p.piece_type === 'king' && p.color === G.side_to_move) { checkSq = i; break; }
+    }
+  }
+
+  const board = document.getElementById('board');
+  board.innerHTML = '';
+  for (let row = 0; row < 8; row++) {
+    for (let col = 0; col < 8; col++) {
+      const f  = flipped ? 7 - col : col;
+      const r  = flipped ? row     : 7 - row;
+      const sq = idx(f, r);
+      const p  = G.board[sq];
+
+      const div = document.createElement('div');
+      div.className  = 'sq ' + ((f + r) % 2 === 0 ? 'dark' : 'light');
+      div.dataset.sq = sq;
+
+      if (sq === selected)                                                       div.classList.add('sq-sel');
+      else if (G.last_move && (sq === G.last_move[0] || sq === G.last_move[1])) div.classList.add('sq-last');
+      if (sq === checkSq)                                                        div.classList.add('sq-check');
+      if (dests.has(sq)) div.classList.add(dests.get(sq) === 'capture' ? 'sq-cap' : 'sq-legal');
+
+      if (p) {
+        const span = document.createElement('span');
+        span.className   = 'piece ' + p.color;
+        span.textContent = GLYPH[p.color][p.piece_type];
+        div.appendChild(span);
+      }
+
+      div.addEventListener('click', () => onSquareClick(sq));
+      board.appendChild(div);
+    }
+  }
+
+  // Status
+  const st = document.getElementById('status');
+  st.className = '';
+  if (G.status === 'playing') {
+    if (G.in_check)                             { st.textContent = `${cap(G.side_to_move)} to move — CHECK!`; st.classList.add('check'); }
+    else if (G.side_to_move !== G.human_color)  { st.textContent = `${cap(G.engine_name)} is thinking…`;     st.classList.add('wait'); }
+    else                                        { st.textContent = `${cap(G.side_to_move)} to move`; }
+  } else if (G.status === 'checkmate') { st.textContent = `Checkmate — ${cap(G.winner)} wins!`; st.classList.add('end'); }
+  else if (G.status === 'stalemate')   { st.textContent = 'Stalemate — draw!';                   st.classList.add('end'); }
+  else if (G.status === 'resigned')    { st.textContent = `Resigned — ${cap(G.winner)} wins!`;   st.classList.add('end'); }
+
+  // Move history
+  const ml = document.getElementById('move-list');
+  ml.innerHTML = '';
+  for (let i = 0; i < G.history.length; i += 2) {
+    const row = document.createElement('div');
+    row.className = 'mrow';
+    const num = document.createElement('span'); num.className = 'mnum'; num.textContent = (i/2+1) + '.';
+    const wm  = document.createElement('span');
+    wm.className = 'mcell' + (i === G.history.length - 1 ? ' hi' : '');
+    wm.textContent = G.history[i].san;
+    row.append(num, wm);
+    if (i + 1 < G.history.length) {
+      const bm = document.createElement('span');
+      bm.className = 'mcell' + (i + 1 === G.history.length - 1 ? ' hi' : '');
+      bm.textContent = G.history[i + 1].san;
+      row.appendChild(bm);
+    }
+    ml.appendChild(row);
+  }
+  ml.scrollTop = ml.scrollHeight;
+
+  // Buttons
+  document.getElementById('btn-resign').disabled = G.status !== 'playing';
+}
+
+// ── Click handling ────────────────────────────────────────────────────────────
+async function onSquareClick(sq) {
+  if (G.status !== 'playing' || G.side_to_move !== G.human_color) return;
+  const p = G.board[sq];
+
+  if (selected === null) {
+    if (p && p.color === G.human_color && legalDests(sq).size > 0) {
+      selected = sq; render();
+    }
+    return;
+  }
+
+  if (sq === selected) { selected = null; render(); return; }
+
+  const dests = legalDests(selected);
+  if (dests.has(sq)) {
+    const isPromo = G.legal_moves.some(u => uciFrom(u) === selected && uciTo(u) === sq && u.length === 5);
+    if (isPromo) showPromo(selected, sq);
+    else         await submitMove(selected, sq, null);
+  } else if (p && p.color === G.human_color && legalDests(sq).size > 0) {
+    selected = sq; render();
+  } else {
+    selected = null; render();
+  }
+}
+
+// ── Move submission ───────────────────────────────────────────────────────────
+async function submitMove(from, to, promo) {
+  selected = null;
+  G = await api('/api/move', 'POST', { from, to, promo });
+  render();
+  if (G.status === 'playing' && G.side_to_move !== G.human_color)
+    setTimeout(triggerEngine, 380);
+}
+
+async function triggerEngine() {
+  G = await api('/api/engine-move', 'POST');
+  render();
+}
+
+// ── Promotion dialog ──────────────────────────────────────────────────────────
+function showPromo(from, to) {
+  promoFrom = from; promoTo = to;
+  const box = document.getElementById('promo-pieces');
+  box.innerHTML = '';
+  for (const [k, label] of [['q','queen'],['r','rook'],['b','bishop'],['n','knight']]) {
+    const btn = document.createElement('button');
+    btn.className   = 'pb';
+    btn.textContent = GLYPH[G.human_color][label];
+    btn.title       = cap(label);
+    btn.onclick = () => {
+      document.getElementById('promo').classList.add('hidden');
+      submitMove(promoFrom, promoTo, k);
+    };
+    box.appendChild(btn);
+  }
+  document.getElementById('promo').classList.remove('hidden');
+}
+
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') {
+    document.getElementById('promo').classList.add('hidden');
+    promoFrom = promoTo = null;
+  }
+});
+
+// ── Controls ──────────────────────────────────────────────────────────────────
+document.querySelectorAll('.color-btn').forEach(btn => btn.addEventListener('click', () => {
+  document.querySelectorAll('.color-btn').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+}));
+
+document.getElementById('btn-new').addEventListener('click', async () => {
+  selected = null;
+  const color = document.querySelector('.color-btn.active').dataset.color;
+  G = await api('/api/restart', 'POST', { human_color: color });
+  render();
+  if (G.status === 'playing' && G.side_to_move !== G.human_color)
+    setTimeout(triggerEngine, 380);
+});
+
+document.getElementById('btn-resign').addEventListener('click', async () => {
+  if (G.status !== 'playing') return;
+  G = await api('/api/resign', 'POST');
+  render();
+});
+
+// ── Boot ──────────────────────────────────────────────────────────────────────
+(async () => {
+  G = await api('/api/state');
+  render();
+  if (G.status === 'playing' && G.side_to_move !== G.human_color)
+    setTimeout(triggerEngine, 300);
+})();
+</script>
+</body>
+</html>
