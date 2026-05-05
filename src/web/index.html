@@ -411,18 +411,15 @@ textarea::placeholder { color: var(--muted); }
       <input type="range" id="depth-range" min="1" max="8" value="5">
     </div>
 
-    <div class="ctrl ctrl-disabled">
-      <div class="soon-row">
-        <span class="lbl" style="margin:0">Book Openings</span>
-        <span class="soon-badge">SOON</span>
-      </div>
+    <div class="ctrl">
+      <div class="lbl">Book Openings</div>
       <div class="toggle-wrap">
         <label class="toggle">
-          <input type="checkbox" disabled>
+          <input type="checkbox" id="book-toggle">
           <span class="toggle-track"></span>
           <span class="toggle-thumb"></span>
         </label>
-        <span class="toggle-label">Off</span>
+        <span class="toggle-label" id="book-label">Off</span>
       </div>
     </div>
 
@@ -661,6 +658,12 @@ function render() {
   // Sync engine selector
   document.getElementById('engine-sel').value = G.engine_type;
 
+  // Sync book toggle
+  const bookToggle = document.getElementById('book-toggle');
+  const bookLabel  = document.getElementById('book-label');
+  bookToggle.checked     = G.use_book;
+  bookLabel.textContent  = G.use_book ? 'On' : 'Off';
+
   // Buttons
   document.getElementById('btn-resign').disabled = G.status !== 'playing';
   document.getElementById('btn-undo').disabled   = G.history.length === 0;
@@ -752,6 +755,7 @@ function getSettings() {
     human_color: document.querySelector('.color-btn.active').dataset.color,
     engine:      document.getElementById('engine-sel').value,
     depth:       parseInt(document.getElementById('depth-range').value, 10),
+    use_book:    document.getElementById('book-toggle').checked,
   };
 }
 

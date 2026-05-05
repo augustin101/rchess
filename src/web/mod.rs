@@ -15,6 +15,7 @@ use crate::core::types::{Color, PieceType, Square};
 use crate::engine::eval::{static_eval, CHECKMATE_SCORE};
 use crate::engine::random::RandomEngine;
 use crate::engine::alpha_beta::AlphaBetaEngine;
+use crate::engine::opening_book::{BookEngine, OpeningBook};
 use crate::engine::Engine;
 
 // ── Game state ────────────────────────────────────────────────────────────────
@@ -37,21 +38,25 @@ struct Game {
     engine:        Box<dyn Engine + Send>,
     engine_type:   String,
     depth:         u32,
+    use_book:      bool,
 }
 
-fn make_engine(engine_type: &str, depth: u32) -> Box<dyn Engine + Send> {
-    match engine_type {
-        "random" => Box::new(RandomEngine::new()) as Box<dyn Engine + Send>,
-        _        => Box::new(AlphaBetaEngine::with_depth(depth)) as Box<dyn Engine + Send>,
+fn make_engine(engine_type: &str, depth: u32, use_book: bool) -> Box<dyn Engine + Send> {
+    let book = if use_book { Some(OpeningBook::load_default()) } else { None };
+    match (engine_type, book) {
+        ("random", Some(b)) => Box::new(BookEngine::new(b, RandomEngine::new())),
+        ("random", None)    => Box::new(RandomEngine::new()),
+        (_,        Some(b)) => Box::new(BookEngine::new(b, AlphaBetaEngine::with_depth(depth))),
+        (_,        None)    => Box::new(AlphaBetaEngine::with_depth(depth)),
     }
 }
 
 impl Game {
     fn new(human_color: Color) -> Self {
-        Self::from_board(human_color, "alpha-beta", 5, Board::starting_position())
+        Self::from_board(human_color, "alpha-beta", 5, true, Board::starting_position())
     }
 
-    fn from_board(human_color: Color, engine_type: &str, depth: u32, board: Board) -> Self {
+    fn from_board(human_color: Color, engine_type: &str, depth: u32, use_book: bool, board: Board) -> Self {
         let mut game = Game {
             board,
             history:       Vec::new(),
@@ -59,9 +64,10 @@ impl Game {
             last_move:     None,
             status:        Status::Playing,
             human_color,
-            engine:        make_engine(engine_type, depth),
+            engine:        make_engine(engine_type, depth, use_book),
             engine_type:   engine_type.to_string(),
             depth,
+            use_book,
         };
         game.refresh_status();
         game
@@ -150,6 +156,7 @@ impl Game {
             engine_name:  self.engine.name().to_string(),
             engine_type:  self.engine_type.clone(),
             depth:        self.depth,
+            use_book:     self.use_book,
             eval:         self.eval(),
             fen:          self.board.to_fen(),
         }
@@ -193,6 +200,7 @@ struct GameState {
     engine_name:  String,
     engine_type:  String,
     depth:        u32,
+    use_book:     bool,
     eval:         i32,
     fen:          String,
 }
@@ -205,6 +213,7 @@ struct RestartReq {
     human_color: Option<String>,
     engine:      Option<String>,
     depth:       Option<u32>,
+    use_book:    Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -213,6 +222,7 @@ struct LoadFenReq {
     human_color: Option<String>,
     engine:      Option<String>,
     depth:       Option<u32>,
+    use_book:    Option<bool>,
 }
 
 // ── Handlers ──────────────────────────────────────────────────────────────────
@@ -279,8 +289,9 @@ async fn api_restart(State(g): State<Shared>, Json(req): Json<RestartReq>) -> Js
     let color       = parse_color(req.human_color.as_deref());
     let engine_type = parse_engine_type(req.engine.as_deref());
     let depth       = parse_depth(req.depth);
+    let use_book    = req.use_book.unwrap_or(true);
     let mut game    = g.lock().unwrap();
-    *game = Game::from_board(color, engine_type, depth, Board::starting_position());
+    *game = Game::from_board(color, engine_type, depth, use_book, Board::starting_position());
     Json(game.to_response())
 }
 
@@ -288,9 +299,10 @@ async fn api_load_fen(State(g): State<Shared>, Json(req): Json<LoadFenReq>) -> J
     let color       = parse_color(req.human_color.as_deref());
     let engine_type = parse_engine_type(req.engine.as_deref());
     let depth       = parse_depth(req.depth);
+    let use_book    = req.use_book.unwrap_or(true);
     let mut game    = g.lock().unwrap();
     if let Ok(board) = Board::from_fen(&req.fen) {
-        *game = Game::from_board(color, engine_type, depth, board);
+        *game = Game::from_board(color, engine_type, depth, use_book, board);
     }
     Json(game.to_response())
 }

@@ -404,16 +404,18 @@ fn decode_move(board: &Board, poly: u16) -> Option<Move> {
 pub struct BookEngine<E: Engine> {
     book:  OpeningBook,
     inner: E,
+    name:  String,
 }
 
 impl<E: Engine> BookEngine<E> {
     pub fn new(book: OpeningBook, inner: E) -> Self {
-        BookEngine { book, inner }
+        let name = format!("{} + Book", inner.name());
+        BookEngine { book, inner, name }
     }
 
     /// Convenience: wrap `inner` with the bundled `Elo2400.bin` book.
     pub fn with_default_book(inner: E) -> Self {
-        BookEngine { book: OpeningBook::load_default(), inner }
+        BookEngine::new(OpeningBook::load_default(), inner)
     }
 }
 
@@ -425,7 +427,7 @@ impl<E: Engine> Engine for BookEngine<E> {
         self.inner.choose_move(board)
     }
 
-    fn name(&self) -> &str { self.inner.name() }
+    fn name(&self) -> &str { &self.name }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
