@@ -423,16 +423,16 @@ textarea::placeholder { color: var(--muted); }
       </div>
     </div>
 
-    <div class="ctrl ctrl-disabled">
-      <div class="soon-row">
+    <div class="ctrl" id="rand-ctrl">
+      <div class="slider-row">
         <span class="lbl" style="margin:0">Randomness</span>
-        <span class="soon-badge">SOON</span>
+        <span class="slider-val" id="rand-val">30</span>
       </div>
-      <div class="slider-row" style="margin:0">
+      <div class="slider-row" style="margin:0; margin-bottom:4px">
         <span style="font-size:0.72em;color:var(--muted)">Deterministic</span>
         <span style="font-size:0.72em;color:var(--muted)">Creative</span>
       </div>
-      <input type="range" min="0" max="100" value="0" disabled>
+      <input type="range" id="rand-range" min="0" max="100" value="30">
     </div>
   </div>
 
@@ -661,8 +661,16 @@ function render() {
   // Sync book toggle
   const bookToggle = document.getElementById('book-toggle');
   const bookLabel  = document.getElementById('book-label');
-  bookToggle.checked     = G.use_book;
-  bookLabel.textContent  = G.use_book ? 'On' : 'Off';
+  bookToggle.checked    = G.use_book;
+  bookLabel.textContent = G.use_book ? 'On' : 'Off';
+
+  // Sync randomness slider
+  const randRange = document.getElementById('rand-range');
+  if (randRange.value != G.randomness) {
+    randRange.value = G.randomness;
+    document.getElementById('rand-val').textContent = G.randomness;
+  }
+  setRandEnabled(G.use_book);
 
   // Buttons
   document.getElementById('btn-resign').disabled = G.status !== 'playing';
@@ -750,12 +758,31 @@ document.getElementById('depth-range').addEventListener('input', e => {
   document.getElementById('depth-val').textContent = e.target.value;
 });
 
+// Randomness slider live label
+document.getElementById('rand-range').addEventListener('input', e => {
+  document.getElementById('rand-val').textContent = e.target.value;
+});
+
+// Book toggle → grey randomness instantly
+document.getElementById('book-toggle').addEventListener('change', () => {
+  const on = document.getElementById('book-toggle').checked;
+  document.getElementById('book-label').textContent = on ? 'On' : 'Off';
+  setRandEnabled(on);
+});
+
+function setRandEnabled(on) {
+  const ctrl = document.getElementById('rand-ctrl');
+  ctrl.style.opacity       = on ? '1' : '0.35';
+  ctrl.style.pointerEvents = on ? ''  : 'none';
+}
+
 function getSettings() {
   return {
     human_color: document.querySelector('.color-btn.active').dataset.color,
     engine:      document.getElementById('engine-sel').value,
     depth:       parseInt(document.getElementById('depth-range').value, 10),
     use_book:    document.getElementById('book-toggle').checked,
+    randomness:  parseInt(document.getElementById('rand-range').value, 10),
   };
 }
 

@@ -39,24 +39,25 @@ struct Game {
     engine_type:   String,
     depth:         u32,
     use_book:      bool,
+    randomness:    u8,
 }
 
-fn make_engine(engine_type: &str, depth: u32, use_book: bool) -> Box<dyn Engine + Send> {
+fn make_engine(engine_type: &str, depth: u32, use_book: bool, randomness: u8) -> Box<dyn Engine + Send> {
     let book = if use_book { Some(OpeningBook::load_default()) } else { None };
     match (engine_type, book) {
-        ("random", Some(b)) => Box::new(BookEngine::new(b, RandomEngine::new())),
+        ("random", Some(b)) => Box::new(BookEngine::new(b, RandomEngine::new(), randomness)),
         ("random", None)    => Box::new(RandomEngine::new()),
-        (_,        Some(b)) => Box::new(BookEngine::new(b, AlphaBetaEngine::with_depth(depth))),
+        (_,        Some(b)) => Box::new(BookEngine::new(b, AlphaBetaEngine::with_depth(depth), randomness)),
         (_,        None)    => Box::new(AlphaBetaEngine::with_depth(depth)),
     }
 }
 
 impl Game {
     fn new(human_color: Color) -> Self {
-        Self::from_board(human_color, "alpha-beta", 5, true, Board::starting_position())
+        Self::from_board(human_color, "alpha-beta", 5, true, 30, Board::starting_position())
     }
 
-    fn from_board(human_color: Color, engine_type: &str, depth: u32, use_book: bool, board: Board) -> Self {
+    fn from_board(human_color: Color, engine_type: &str, depth: u32, use_book: bool, randomness: u8, board: Board) -> Self {
         let mut game = Game {
             board,
             history:       Vec::new(),
@@ -64,10 +65,11 @@ impl Game {
             last_move:     None,
             status:        Status::Playing,
             human_color,
-            engine:        make_engine(engine_type, depth, use_book),
+            engine:        make_engine(engine_type, depth, use_book, randomness),
             engine_type:   engine_type.to_string(),
             depth,
             use_book,
+            randomness,
         };
         game.refresh_status();
         game
@@ -157,6 +159,7 @@ impl Game {
             engine_type:  self.engine_type.clone(),
             depth:        self.depth,
             use_book:     self.use_book,
+            randomness:   self.randomness,
             eval:         self.eval(),
             fen:          self.board.to_fen(),
         }
@@ -201,6 +204,7 @@ struct GameState {
     engine_type:  String,
     depth:        u32,
     use_book:     bool,
+    randomness:   u8,
     eval:         i32,
     fen:          String,
 }
@@ -214,6 +218,7 @@ struct RestartReq {
     engine:      Option<String>,
     depth:       Option<u32>,
     use_book:    Option<bool>,
+    randomness:  Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -223,6 +228,7 @@ struct LoadFenReq {
     engine:      Option<String>,
     depth:       Option<u32>,
     use_book:    Option<bool>,
+    randomness:  Option<u32>,
 }
 
 // ── Handlers ──────────────────────────────────────────────────────────────────
@@ -285,13 +291,18 @@ fn parse_depth(d: Option<u32>) -> u32 {
     d.unwrap_or(5).clamp(1, 8)
 }
 
+fn parse_randomness(r: Option<u32>) -> u8 {
+    r.unwrap_or(30).min(100) as u8
+}
+
 async fn api_restart(State(g): State<Shared>, Json(req): Json<RestartReq>) -> Json<GameState> {
     let color       = parse_color(req.human_color.as_deref());
     let engine_type = parse_engine_type(req.engine.as_deref());
     let depth       = parse_depth(req.depth);
     let use_book    = req.use_book.unwrap_or(true);
+    let randomness  = parse_randomness(req.randomness);
     let mut game    = g.lock().unwrap();
-    *game = Game::from_board(color, engine_type, depth, use_book, Board::starting_position());
+    *game = Game::from_board(color, engine_type, depth, use_book, randomness, Board::starting_position());
     Json(game.to_response())
 }
 
@@ -300,9 +311,10 @@ async fn api_load_fen(State(g): State<Shared>, Json(req): Json<LoadFenReq>) -> J
     let engine_type = parse_engine_type(req.engine.as_deref());
     let depth       = parse_depth(req.depth);
     let use_book    = req.use_book.unwrap_or(true);
+    let randomness  = parse_randomness(req.randomness);
     let mut game    = g.lock().unwrap();
     if let Ok(board) = Board::from_fen(&req.fen) {
-        *game = Game::from_board(color, engine_type, depth, use_book, board);
+        *game = Game::from_board(color, engine_type, depth, use_book, randomness, board);
     }
     Json(game.to_response())
 }

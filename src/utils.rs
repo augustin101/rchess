@@ -19,4 +19,10 @@ impl Xorshift64 {
     pub fn next_usize(&mut self) -> usize {
         self.next_u64() as usize
     }
+
+    /// Returns a float uniformly distributed in [0, 1).
+    #[inline]
+    pub fn next_f64(&mut self) -> f64 {
+        (self.next_u64() >> 11) as f64 * (1.0 / (1u64 << 53) as f64)
+    }
 }

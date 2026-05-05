@@ -5,6 +5,7 @@ use crate::core::attacks::pawn_attacks;
 use crate::core::board::Board;
 use crate::core::moves::{Move, PromoKind};
 use crate::core::types::{Color, CastlingRights, PieceType, Square};
+use crate::utils::Xorshift64;
 use super::Engine;
 
 // ── Polyglot random numbers ───────────────────────────────────────────────────
@@ -324,24 +325,24 @@ impl OpeningBook {
         OpeningBook { entries }
     }
 
-    /// Probe the book for the current position.
-    ///
-    /// Returns the highest-weight book move translated to our internal `Move`
-    /// type, or `None` if the position is not in the book.
-    pub fn probe(&self, board: &Board) -> Option<Move> {
+    /// All book moves for the position, as `(Move, weight)` pairs.
+    /// Returns an empty vec if the position is not in the book.
+    pub fn candidates(&self, board: &Board) -> Vec<(Move, u16)> {
         let key = polyglot_hash(board);
         let idx = self.entries.partition_point(|e| e.key < key);
-
-        let candidates: Vec<&BookEntry> = self.entries[idx..]
+        self.entries[idx..]
             .iter()
             .take_while(|e| e.key == key)
-            .collect();
+            .filter_map(|e| decode_move(board, e.poly_move).map(|mv| (mv, e.weight)))
+            .collect()
+    }
 
-        if candidates.is_empty() { return None; }
-
-        // Pick the move with the highest weight (most common in the book).
-        let best = candidates.iter().max_by_key(|e| e.weight).unwrap();
-        decode_move(board, best.poly_move)
+    /// Probe the book deterministically (highest-weight move).
+    pub fn probe(&self, board: &Board) -> Option<Move> {
+        self.candidates(board)
+            .into_iter()
+            .max_by_key(|(_, w)| *w)
+            .map(|(mv, _)| mv)
     }
 }
 
@@ -401,33 +402,72 @@ fn decode_move(board: &Board, poly: u16) -> Option<Move> {
 
 /// Wraps any engine with an opening book.  Book moves are played until the
 /// position is no longer recognised, after which the inner engine takes over.
+///
+/// `randomness` (0–100) controls move selection:
+///   0   → always pick the highest-weight move (deterministic)
+///   1–99 → weighted random where higher values flatten the distribution
+///   100 → uniform random among all book moves for the position
 pub struct BookEngine<E: Engine> {
-    book:  OpeningBook,
-    inner: E,
-    name:  String,
+    book:       OpeningBook,
+    inner:      E,
+    randomness: u8,
+    rng:        Xorshift64,
+    name:       String,
 }
 
 impl<E: Engine> BookEngine<E> {
-    pub fn new(book: OpeningBook, inner: E) -> Self {
+    pub fn new(book: OpeningBook, inner: E, randomness: u8) -> Self {
         let name = format!("{} + Book", inner.name());
-        BookEngine { book, inner, name }
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos() as u64 ^ (d.as_secs() << 17))
+            .unwrap_or(0xc0ffee_b007);
+        BookEngine { book, inner, randomness: randomness.min(100), rng: Xorshift64::new(seed), name }
     }
 
-    /// Convenience: wrap `inner` with the bundled `Elo2400.bin` book.
-    pub fn with_default_book(inner: E) -> Self {
-        BookEngine::new(OpeningBook::load_default(), inner)
+    /// Convenience: wrap `inner` with the bundled book and a given randomness.
+    pub fn with_default_book(inner: E, randomness: u8) -> Self {
+        BookEngine::new(OpeningBook::load_default(), inner, randomness)
     }
 }
 
 impl<E: Engine> Engine for BookEngine<E> {
     fn choose_move(&mut self, board: &Board) -> Option<Move> {
-        if let Some(mv) = self.book.probe(board) {
-            return Some(mv);
+        let candidates = self.book.candidates(board);
+        if candidates.is_empty() {
+            return self.inner.choose_move(board);
         }
-        self.inner.choose_move(board)
+        Some(if self.randomness == 0 {
+            candidates.iter().max_by_key(|(_, w)| *w).unwrap().0
+        } else {
+            weighted_pick(&candidates, self.randomness, &mut self.rng)
+        })
     }
 
     fn name(&self) -> &str { &self.name }
+}
+
+/// Pick a move using weighted probability.
+///
+/// Each candidate's probability is proportional to `weight^α` where
+/// `α = (100 - randomness) / 100`.  α = 1 means proportional to raw
+/// weights; α = 0 means uniform random.
+fn weighted_pick(candidates: &[(Move, u16)], randomness: u8, rng: &mut Xorshift64) -> Move {
+    if candidates.len() == 1 { return candidates[0].0; }
+
+    let alpha = (100 - randomness) as f64 / 100.0;
+    let weights: Vec<f64> = candidates
+        .iter()
+        .map(|(_, w)| if alpha == 0.0 { 1.0 } else { (*w as f64).powf(alpha) })
+        .collect();
+    let total: f64 = weights.iter().sum();
+    let mut r = rng.next_f64() * total;
+
+    for ((mv, _), w) in candidates.iter().zip(weights.iter()) {
+        r -= w;
+        if r <= 0.0 { return *mv; }
+    }
+    candidates.last().unwrap().0
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
