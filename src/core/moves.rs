@@ -172,11 +172,12 @@ impl<'a> IntoIterator for &'a MoveList {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::squares::*;
 
     #[test]
     fn move_encoding_roundtrip() {
-        let from =  Square::new(4, 1); // e2
-        let to   = Square::new(4, 3); // e4
+        let from =  E2;
+        let to   = E4;
         let mv   = Move::normal(from, to);
         assert_eq!(mv.from_sq(), from);
         assert_eq!(mv.to_sq(),   to);
@@ -185,8 +186,8 @@ mod tests {
 
     #[test]
     fn promo_encoding() {
-        let from = Square::new(4, 6); // e7
-        let to   = Square::new(4, 7); // e8
+        let from = E7;
+        let to   = E8;
         let mv   = Move::promo(from, to, PromoKind::Queen);
         assert_eq!(mv.from_sq(),         from);
         assert_eq!(mv.to_sq(),           to);

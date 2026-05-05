@@ -108,7 +108,7 @@ pub struct Square(pub u8);
 
 impl Square {
     #[inline]
-    pub fn new(file: u8, rank: u8) -> Self {
+    pub const fn new(file: u8, rank: u8) -> Self {
         debug_assert!(file < 8 && rank < 8);
         Square(rank * 8 + file)
     }

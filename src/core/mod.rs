@@ -5,5 +5,6 @@ pub mod movegen;
 pub mod moves;
 pub mod perft;
 pub mod san;
+pub mod squares;
 pub mod types;
 pub mod zobrist;

@@ -548,6 +548,8 @@ impl fmt::Display for Board {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::squares::*;
+    use super::super::moves::Move;
 
     #[test]
     fn starting_fen_round_trip() {
@@ -633,16 +635,41 @@ mod tests {
 
     #[test]
     fn hash_make_unmake_roundtrip() {
-        use super::super::moves::Move;
         let mut b = Board::starting_position();
         let h0 = b.hash;
         // e2e4 — normal double pawn push (sets en-passant square)
-        let mv = Move::normal(Square::new(4, 1), Square::new(4, 3));
+        let mv = Move::normal(E2, E4);
         let state = b.make_move(mv);
         assert_ne!(b.hash, h0, "hash must change after make_move");
         assert_eq!(b.hash, b.compute_hash(), "incremental hash diverged after make_move");
         b.unmake_move(mv, state);
         assert_eq!(b.hash, h0, "hash not restored after unmake_move");
+    }
+
+    #[test]
+    fn hash_same_position_different_move_order() {
+        // Four Knights: 1.e4 e5 2.Nf3 Nc6 3.Nc3 Nf6
+        // Two independent knight manoeuvres played in opposite orders:
+        //   White: Nf3-h4 and Nc3-d5   |  Black: Nc6-d4 and Nf6-h5
+        // No pawn moves → no en-passant; no king/rook moves → castling rights
+        // unchanged. Both sequences must reach exactly the same position.
+
+        let fen = "r1bqkb1r/pppp1ppp/2n2n2/4p3/4P3/2N2N2/PPPP1PPP/R1BQKB1R w KQkq - 4 4";
+
+        let mut b1 = Board::from_fen(fen).unwrap();
+        b1.make_move(Move::normal(F3, H4));
+        b1.make_move(Move::normal(C6, D4));
+        b1.make_move(Move::normal(C3, D5));
+        b1.make_move(Move::normal(F6, H5));
+
+        let mut b2 = Board::from_fen(fen).unwrap();
+        b2.make_move(Move::normal(C3, D5));
+        b2.make_move(Move::normal(F6, H5));
+        b2.make_move(Move::normal(F3, H4));
+        b2.make_move(Move::normal(C6, D4));
+
+        assert_eq!(b1.to_fen(), b2.to_fen(), "positions must be identical");
+        assert_eq!(b1.hash,     b2.hash,     "Zobrist hash must match for identical positions");
     }
 
     #[test]
