@@ -292,6 +292,14 @@ pub const CASTLING_RIGHTS_MASK: [u8; 64] = {
     m
 };
 
+// ── Null-move state snapshot ──────────────────────────────────────────────────
+
+#[derive(Clone, Copy, Debug)]
+pub struct NullMoveState {
+    pub en_passant: Option<Square>,
+    pub hash:       u64,
+}
+
 // ── Irreversible state snapshot (needed for unmake_move) ──────────────────────
 
 #[derive(Clone, Copy, Debug)]
@@ -436,6 +444,28 @@ impl Board {
         // Restore pre-move hash; the put/remove calls above XOR'd piece keys
         // that are not needed since we're restoring the saved snapshot.
         self.hash = state.hash;
+    }
+
+    // ── Null move ─────────────────────────────────────────────────────────────
+
+    /// Pass the move (flip side to move) without touching pieces.
+    /// Returns the state needed to undo with `unmake_null_move`.
+    pub fn make_null_move(&mut self) -> NullMoveState {
+        let keys = zobrist_keys();
+        let state = NullMoveState { en_passant: self.en_passant, hash: self.hash };
+        if let Some(sq) = self.en_passant {
+            self.hash ^= keys.en_passant[sq.file() as usize];
+            self.en_passant = None;
+        }
+        self.hash ^= keys.side;
+        self.side_to_move = self.side_to_move.flip();
+        state
+    }
+
+    pub fn unmake_null_move(&mut self, state: NullMoveState) {
+        self.side_to_move = self.side_to_move.flip();
+        self.en_passant   = state.en_passant;
+        self.hash         = state.hash;
     }
 
     // ── Zobrist ───────────────────────────────────────────────────────────────
