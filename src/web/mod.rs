@@ -291,7 +291,7 @@ fn parse_engine_type(s: Option<&str>) -> &'static str {
 }
 
 fn parse_depth(d: Option<u32>) -> u32 {
-    d.unwrap_or(5).clamp(1, 8)
+    d.unwrap_or(10).clamp(1, 15)
 }
 
 fn parse_randomness(r: Option<u32>) -> u8 {
