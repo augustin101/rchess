@@ -10,6 +10,30 @@ const NEG_INF: i32 = -(CHECKMATE_SCORE + 1);
 const POS_INF: i32 =   CHECKMATE_SCORE + 1;
 const MAX_PLY: usize = 64;
 
+// ── Move ordering scores ──────────────────────────────────────────────────────
+// Each bucket must be strictly above the one below it to preserve ordering
+// priority.  Actual values are arbitrary as long as the gaps are wide enough.
+const SCORE_TT_MOVE:      i32 = 30_000_000; // always searched first
+const SCORE_PROMO_BASE:   i32 =  9_000_000; // + piece_value(promo piece)
+const SCORE_CAPTURE_BASE: i32 =  1_000_000; // + MVV-LVA delta
+const SCORE_KILLER:       i32 =    900_000; // below captures, above history
+// History scores live in [0, HISTORY_MAX] and fall below killers naturally.
+const SCORE_QUIET_SKIP:   i32 =         -1; // sentinel: sorted to back, then skipped
+const HISTORY_MAX:        i32 =     32_000;
+
+// ── Search tuning parameters ──────────────────────────────────────────────────
+const NULL_MIN_DEPTH:  u32 = 3; // don't try null move at shallow depths
+const NULL_FULL_DEPTH: u32 = 6; // use larger reduction at this depth and above
+const NULL_R_PARTIAL:  u32 = 2; // reduction below NULL_FULL_DEPTH
+const NULL_R_FULL:     u32 = 3; // reduction at/above NULL_FULL_DEPTH
+
+const FUTILITY_MAX_DEPTH: u32 = 2;   // apply futility pruning only at depth 1-2
+const FUTILITY_MARGIN_1:  i32 = 100; // centipawn margin at depth 1
+const FUTILITY_MARGIN_2:  i32 = 300; // centipawn margin at depth 2
+
+const LMR_MIN_QUIET: usize = 3; // start reducing after this many quiet moves
+const LMR_MIN_DEPTH: u32   = 3; // don't reduce at shallow depths
+
 // ── Transposition Table ───────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
@@ -97,7 +121,7 @@ impl HistoryTable {
     #[inline]
     fn update(&mut self, color: Color, from: u8, to: u8, depth: u32) {
         let v = &mut self.0[color as usize][from as usize][to as usize];
-        *v = (*v + (depth as i32) * (depth as i32)).min(32_000);
+        *v = (*v + (depth as i32) * (depth as i32)).min(HISTORY_MAX);
     }
 
     #[inline]
@@ -138,20 +162,41 @@ fn piece_value(pt: PieceType) -> i32 {
     }
 }
 
+// ── MVV-LVA capture score ─────────────────────────────────────────────────────
+// For en passant, piece_at(to_sq) is None; the pawn default (100) is correct.
+
+#[inline]
+fn capture_mvv_lva(board: &Board, mv: Move) -> i32 {
+    let vv = board.piece_at(mv.to_sq()).map_or(100, |p| piece_value(p.piece_type));
+    let av = board.piece_at(mv.from_sq()).map_or(100, |p| piece_value(p.piece_type));
+    SCORE_CAPTURE_BASE + vv * 10 - av
+}
+
+// ── LMR reduction depth ───────────────────────────────────────────────────────
+
+#[inline]
+fn lmr_reduction(quiet_count: usize) -> u32 {
+    1 + (quiet_count as u32) / 6
+}
+
 // ── Move scoring ──────────────────────────────────────────────────────────────
 // Priority: TT/hash move > promotions > captures (MVV-LVA) > killers > history
 
 #[inline]
-fn score_move(board: &Board, mv: Move, tt_move: Move, killers: &KillerTable, history: &HistoryTable, ply: usize) -> i32 {
-    if mv == tt_move { return 30_000_000; }
-    if mv.is_promo() { return 9_000_000 + piece_value(mv.promo_piece_type()); }
-    let victim = board.piece_at(mv.to_sq());
-    if victim.is_some() || mv.is_en_passant() {
-        let vv = victim.map_or(100, |p| piece_value(p.piece_type));
-        let av = board.piece_at(mv.from_sq()).map_or(100, |p| piece_value(p.piece_type));
-        return 1_000_000 + vv * 10 - av;
+fn score_move(
+    board:   &Board,
+    mv:      Move,
+    tt_move: Move,
+    killers: &KillerTable,
+    history: &HistoryTable,
+    ply:     usize,
+) -> i32 {
+    if mv == tt_move { return SCORE_TT_MOVE; }
+    if mv.is_promo() { return SCORE_PROMO_BASE + piece_value(mv.promo_piece_type()); }
+    if board.piece_at(mv.to_sq()).is_some() || mv.is_en_passant() {
+        return capture_mvv_lva(board, mv);
     }
-    if killers.is_killer(mv, ply) { return 900_000; }
+    if killers.is_killer(mv, ply) { return SCORE_KILLER; }
     history.get(board.side_to_move, mv.from_sq().0, mv.to_sq().0)
 }
 
@@ -230,6 +275,7 @@ fn search_root(board: &mut Board, depth: u32, ctx: &mut SearchContext) -> Option
     let mut best_move = Move::NULL;
 
     for i in 0..n {
+        // Incremental selection sort: pull best remaining move to position i.
         let mut bi = i;
         for j in (i + 1)..n { if scores[j] > scores[bi] { bi = j; } }
         moves.swap(i, bi);
@@ -289,10 +335,11 @@ fn negamax(
     let in_check = board.is_in_check();
 
     // ── Null move pruning ─────────────────────────────────────────────────────
-    // Skip a turn; if the result is still >= beta, our position is so strong
-    // the opponent can't defend even with a free move.
-    if allow_null && !in_check && depth >= 3 && has_non_pawn_material(board) {
-        let r = if depth >= 6 { 3 } else { 2 };
+    // Skip our turn; if the score is still >= beta the position is strong
+    // enough that we can prune.  Disabled in check and pawn/king endgames
+    // (zugzwang risk).
+    if allow_null && !in_check && depth >= NULL_MIN_DEPTH && has_non_pawn_material(board) {
+        let r = if depth >= NULL_FULL_DEPTH { NULL_R_FULL } else { NULL_R_PARTIAL };
         let ns = board.make_null_move();
         let null_score = -negamax(board, depth - 1 - r, ply + 1, -beta, -beta + 1, ctx, false);
         board.unmake_null_move(ns);
@@ -302,12 +349,12 @@ fn negamax(
     }
 
     // ── Futility pruning ──────────────────────────────────────────────────────
-    // At depth 1 or 2, when static eval is far below alpha, quiet moves are
-    // unlikely to raise the score enough — skip them.
-    let futility_prunable = !in_check && depth <= 2 && {
+    // At depth 1-2, if the static eval is far below alpha, quiet moves are
+    // unlikely to recover; skip them.
+    let futility_prunable = !in_check && depth <= FUTILITY_MAX_DEPTH && {
         let raw = static_eval(board);
         let eval = if board.side_to_move == Color::White { raw } else { -raw };
-        let margin = if depth == 1 { 100 } else { 300 };
+        let margin = if depth == 1 { FUTILITY_MARGIN_1 } else { FUTILITY_MARGIN_2 };
         eval + margin < alpha
     };
 
@@ -351,20 +398,20 @@ fn negamax(
         has_legal = true;
         let gives_check = board.is_in_check();
 
-        // ── Check extension: spend an extra ply when a move delivers check ───
+        // ── Check extension ───────────────────────────────────────────────────
+        // Spend an extra ply when a move delivers check.
         let extension: u32 = if gives_check && ply < MAX_PLY - 1 { 1 } else { 0 };
 
-        // ── Late Move Reductions ──────────────────────────────────────────────
-        // Quiet moves that come late in the ordered list are unlikely to be
-        // the best move — search them at a reduced depth first.
+        // ── Late Move Reductions (LMR) ────────────────────────────────────────
+        // Quiet moves late in the ordered list are unlikely to be the best
+        // move; search them at a reduced depth first and re-search only if
+        // they beat alpha.
         let score = if is_quiet && !gives_check && extension == 0
-            && quiet_count >= 3 && depth >= 3
+            && quiet_count >= LMR_MIN_QUIET && depth >= LMR_MIN_DEPTH
         {
-            let reduction = 1u32 + (quiet_count as u32) / 6;
-            let reduced = (depth + extension).saturating_sub(1 + reduction);
+            let reduced = (depth + extension).saturating_sub(1 + lmr_reduction(quiet_count));
             let s = -negamax(board, reduced, ply + 1, -alpha - 1, -alpha, ctx, true);
             if s > alpha {
-                // Full-depth re-search if the reduced search beats alpha.
                 -negamax(board, depth - 1 + extension, ply + 1, -beta, -alpha, ctx, true)
             } else {
                 s
@@ -403,8 +450,8 @@ fn negamax(
 }
 
 // ── Quiescence search ─────────────────────────────────────────────────────────
-// When depth == 0, extend the search with captures and check evasions to
-// avoid evaluating positions at a tactical horizon.
+// Extends the search with captures (and all moves when in check) to avoid
+// evaluating positions at a tactical horizon.
 
 fn quiescence(board: &mut Board, ply: usize, mut alpha: i32, beta: i32, ctx: &mut SearchContext) -> i32 {
     let in_check = board.is_in_check();
@@ -422,21 +469,18 @@ fn quiescence(board: &mut Board, ply: usize, mut alpha: i32, beta: i32, ctx: &mu
     let mut scores = [0i32; 256];
     moves[..n].copy_from_slice(pseudo.as_slice());
 
-    // In quiescence, order captures/promos by MVV-LVA; order all moves when in check.
+    // Score captures/promos by MVV-LVA; quiet moves get SCORE_QUIET_SKIP so
+    // they sort to the back and are skipped by the break below (unless in check).
     for i in 0..n {
         let mv = moves[i];
         scores[i] = if mv.is_promo() {
-            9_000_000 + piece_value(mv.promo_piece_type())
-        } else if let Some(victim) = board.piece_at(mv.to_sq()) {
-            let vv = piece_value(victim.piece_type);
-            let av = board.piece_at(mv.from_sq()).map_or(100, |p| piece_value(p.piece_type));
-            1_000_000 + vv * 10 - av
-        } else if mv.is_en_passant() {
-            1_000_000 + 100 * 10 - 100
+            SCORE_PROMO_BASE + piece_value(mv.promo_piece_type())
+        } else if board.piece_at(mv.to_sq()).is_some() || mv.is_en_passant() {
+            capture_mvv_lva(board, mv)
         } else if in_check {
             ctx.history.get(board.side_to_move, mv.from_sq().0, mv.to_sq().0)
         } else {
-            -1 // will be skipped below
+            SCORE_QUIET_SKIP
         };
     }
 
@@ -450,13 +494,13 @@ fn quiescence(board: &mut Board, ply: usize, mut alpha: i32, beta: i32, ctx: &mu
         scores.swap(i, bi);
 
         let mv = moves[i];
-        // Skip quiet moves unless we're in check.
+        // Once sorted, the first quiet move means all remaining are quiet too.
         if !in_check
             && board.piece_at(mv.to_sq()).is_none()
             && !mv.is_en_passant()
             && !mv.is_promo()
         {
-            break; // sorted list: all remaining are quiet too
+            break;
         }
 
         let state = board.make_move(mv);
@@ -515,13 +559,11 @@ mod tests {
 
     #[test]
     fn finds_checkmate_in_two() {
-        // Position where mate in 2 is available
         let b = board("r1bqkb1r/pppp1ppp/2n2n2/4p2Q/2B1P3/8/PPPP1PPP/RNB1K1NR w KQkq - 4 4");
         let mut engine = AlphaBetaEngine::with_depth(4);
         let mv = engine.choose_move(&b).expect("engine must return a move");
         let mut b2 = b.clone();
         b2.make_move(mv);
-        // After the best move, black should be in serious trouble (in check or forced to lose)
         assert!(b2.is_in_check() || !generate_legal(&b2).is_empty());
     }
 }
