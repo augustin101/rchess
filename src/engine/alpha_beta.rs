@@ -215,9 +215,10 @@ fn has_non_pawn_material(board: &Board) -> bool {
 // ── Engine ────────────────────────────────────────────────────────────────────
 
 pub struct AlphaBetaEngine {
-    depth: u32,
-    name:  String,
-    ctx:   SearchContext,
+    depth:      u32,
+    name:       String,
+    ctx:        SearchContext,
+    last_score: Option<i32>,
 }
 
 impl AlphaBetaEngine {
@@ -233,6 +234,7 @@ impl AlphaBetaEngine {
                 killers: KillerTable::new(),
                 history: HistoryTable::new(),
             },
+            last_score: None,
         }
     }
 }
@@ -243,20 +245,25 @@ impl Engine for AlphaBetaEngine {
         self.ctx.killers = KillerTable::new();
         self.ctx.history.age();
         let mut best = Move::NULL;
+        self.last_score = None;
         for d in 1..=self.depth {
-            if let Some(mv) = search_root(&mut b, d, &mut self.ctx) {
+            if let Some((mv, score)) = search_root(&mut b, d, &mut self.ctx) {
                 best = mv;
+                self.last_score = Some(score); // keep the deepest completed iteration
             }
         }
         if best.is_null() { None } else { Some(best) }
     }
 
     fn name(&self) -> &str { self.name.as_str() }
+
+    fn last_score(&self) -> Option<i32> { self.last_score }
 }
 
 // ── Root search ───────────────────────────────────────────────────────────────
 
-fn search_root(board: &mut Board, depth: u32, ctx: &mut SearchContext) -> Option<Move> {
+// Returns the best move and its score from the mover's perspective.
+fn search_root(board: &mut Board, depth: u32, ctx: &mut SearchContext) -> Option<(Move, i32)> {
     let pseudo = generate_pseudo_legal(board);
     let n = pseudo.len();
     if n == 0 { return None; }
@@ -299,7 +306,7 @@ fn search_root(board: &mut Board, depth: u32, ctx: &mut SearchContext) -> Option
         }
     }
 
-    if best_move.is_null() { None } else { Some(best_move) }
+    if best_move.is_null() { None } else { Some((best_move, alpha)) }
 }
 
 // ── Negamax with alpha-beta ───────────────────────────────────────────────────

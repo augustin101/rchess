@@ -464,6 +464,10 @@ impl<E: Engine> Engine for BookEngine<E> {
     fn name(&self) -> &str { &self.name }
 
     fn last_was_book(&self) -> bool { self.last_was_book }
+
+    fn last_score(&self) -> Option<i32> {
+        if self.last_was_book { None } else { self.inner.last_score() }
+    }
 }
 
 /// Pick a move using weighted probability.

@@ -40,6 +40,9 @@ struct Game {
     depth:         u32,
     use_book:      bool,
     randomness:    u8,
+    /// Last score returned by the engine's search, in centipawns from White's
+    /// perspective.  None until the engine has completed at least one search.
+    engine_eval:   Option<i32>,
 }
 
 fn make_engine(engine_type: &str, depth: u32, use_book: bool, randomness: u8) -> Box<dyn Engine + Send> {
@@ -70,6 +73,7 @@ impl Game {
             depth,
             use_book,
             randomness,
+            engine_eval:   None,
         };
         game.refresh_status();
         game
@@ -101,6 +105,7 @@ impl Game {
             (from, to)
         });
         self.status = Status::Playing;
+        self.engine_eval = None;
     }
 
     fn refresh_status(&mut self) {
@@ -120,7 +125,10 @@ impl Game {
             Status::Checkmate { winner } => if *winner == Color::White { CHECKMATE_SCORE } else { -CHECKMATE_SCORE },
             Status::Stalemate            => 0,
             Status::Resigned  { loser }  => if *loser == Color::White  { -CHECKMATE_SCORE } else { CHECKMATE_SCORE },
-            Status::Playing              => static_eval(&self.board),
+            // Prefer the engine's own search score (deep eval); fall back to
+            // static eval before the engine has searched (e.g. at game start,
+            // after undo, or when the engine played a book move).
+            Status::Playing              => self.engine_eval.unwrap_or_else(|| static_eval(&self.board)),
         }
     }
 
@@ -275,8 +283,14 @@ async fn api_engine_move(State(g): State<Shared>) -> Json<GameState> {
         return Json(game.to_response());
     }
     let board = game.board.clone();
+    let engine_color = board.side_to_move;
     if let Some(mv) = game.engine.choose_move(&board) {
         let from_book = game.engine.last_was_book();
+        // Convert the engine's score (from its own side's perspective) to
+        // White's perspective so the eval bar always points the same way.
+        game.engine_eval = game.engine.last_score().map(|s| {
+            if engine_color == Color::White { s } else { -s }
+        });
         game.apply(mv, from_book);
     }
     Json(game.to_response())
