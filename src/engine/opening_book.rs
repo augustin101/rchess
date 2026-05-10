@@ -3,6 +3,7 @@ use std::path::Path;
 
 use crate::core::attacks::pawn_attacks;
 use crate::core::board::Board;
+use crate::core::movegen::generate_legal;
 use crate::core::moves::{Move, PromoKind};
 use crate::core::types::{Color, CastlingRights, PieceType, Square};
 use crate::utils::Xorshift64;
@@ -327,13 +328,18 @@ impl OpeningBook {
 
     /// All book moves for the position, as `(Move, weight)` pairs.
     /// Returns an empty vec if the position is not in the book.
+    /// Only legal moves are returned; illegal or malformed book entries are silently skipped.
     pub fn candidates(&self, board: &Board) -> Vec<(Move, u16)> {
         let key = polyglot_hash(board);
         let idx = self.entries.partition_point(|e| e.key < key);
+        let legal = generate_legal(board);
         self.entries[idx..]
             .iter()
             .take_while(|e| e.key == key)
-            .filter_map(|e| decode_move(board, e.poly_move).map(|mv| (mv, e.weight)))
+            .filter_map(|e| {
+                let mv = decode_move(board, e.poly_move)?;
+                if legal.as_slice().contains(&mv) { Some((mv, e.weight)) } else { None }
+            })
             .collect()
     }
 
@@ -375,14 +381,22 @@ fn decode_move(board: &Board, poly: u16) -> Option<Move> {
         return Some(Move::promo(from, to, kind));
     }
 
-    // Detect castling: Polyglot stores king-moves (e1g1, e1c1, e8g8, e8c8).
+    // Detect castling.  Most Polyglot books store the king's destination
+    // (e1g1, e1c1, e8g8, e8c8), but some older or Chess960-style books use
+    // "king captures rook" encoding (e1h1, e1a1, e8h8, e8a8).  Both are
+    // remapped to Move::castling(king_from, king_dest).
     if let Some(piece) = board.piece_at(from) {
         if piece.piece_type == PieceType::King {
-            let is_castle = matches!(
-                (from.0, to.0),
-                (4, 6) | (4, 2) | (60, 62) | (60, 58)
-            );
-            if is_castle { return Some(Move::castling(from, to)); }
+            let king_dest = match (from.0, to.0) {
+                (4,  6) | (4,  7) => Some(Square(6)),  // White kingside
+                (4,  2) | (4,  0) => Some(Square(2)),  // White queenside
+                (60, 62) | (60, 63) => Some(Square(62)), // Black kingside
+                (60, 58) | (60, 56) => Some(Square(58)), // Black queenside
+                _ => None,
+            };
+            if let Some(dest) = king_dest {
+                return Some(Move::castling(from, dest));
+            }
         }
     }
 
@@ -504,6 +518,29 @@ mod tests {
             known_first_moves.contains(&mv_str.as_str()),
             "unexpected book move from start: {mv_str}"
         );
+    }
+
+    #[test]
+    fn book_castling_is_legal() {
+        // After 1.e4 d6 2.d4 Nf6 3.Bd3 g6 4.Nf3 Bg7 5.O-O, the book
+        // suggested Kxh8 (king captures own rook) because the .bin file uses
+        // the Chess960 "king-to-rook" encoding (e8h8) for Black's O-O.
+        // Verify that decode_move remaps it to the legal castling move (e8g8)
+        // and that candidates() only returns legal moves.
+        let board = Board::from_fen(
+            "rnbqk2r/ppp1ppbp/3p1np1/8/3PP3/3B1N2/PPP2PPP/RNBQ1RK1 b kq - 1 5",
+        ).unwrap();
+        let book = OpeningBook::load_default();
+        let candidates = book.candidates(&board);
+        // Every returned move must be legal (the motivating bug returned an illegal Kxh8).
+        use crate::core::movegen::generate_legal;
+        let legal = generate_legal(&board);
+        for (mv, _) in &candidates {
+            assert!(
+                legal.as_slice().contains(mv),
+                "book returned illegal move: {mv}"
+            );
+        }
     }
 
     #[test]
