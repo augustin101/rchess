@@ -5,6 +5,7 @@ pub mod alpha_beta;
 pub mod eval;
 pub mod opening_book;
 pub mod random;
+mod pst;
 
 pub trait Engine {
     /// Pick a move for the current side to move. Returns `None` if there are
