@@ -146,6 +146,7 @@ struct SearchContext {
     tt:      TranspositionTable,
     killers: KillerTable,
     history: HistoryTable,
+    nodes:   u64,
 }
 
 // ── Piece values for move ordering ────────────────────────────────────────────
@@ -233,6 +234,7 @@ impl AlphaBetaEngine {
                 tt:      TranspositionTable::new(),
                 killers: KillerTable::new(),
                 history: HistoryTable::new(),
+                nodes:   0,
             },
             last_score: None,
         }
@@ -242,6 +244,8 @@ impl AlphaBetaEngine {
         self.depth = depth.max(1);
         self.name = format!("Alpha-Beta (d={})", self.depth);
     }
+
+    pub fn nodes_searched(&self) -> u64 { self.ctx.nodes }
 
     /// Iterative deepening with a wall-clock deadline. Completes each depth
     /// before checking the clock, then stops if the deadline has passed.
@@ -253,6 +257,7 @@ impl AlphaBetaEngine {
         let mut b = board.clone();
         self.ctx.killers = KillerTable::new();
         self.ctx.history.age();
+        self.ctx.nodes = 0;
         let mut best = Move::NULL;
         self.last_score = None;
         for d in 1..=self.depth {
@@ -271,6 +276,7 @@ impl Engine for AlphaBetaEngine {
         let mut b = board.clone();
         self.ctx.killers = KillerTable::new();
         self.ctx.history.age();
+        self.ctx.nodes = 0;
         let mut best = Move::NULL;
         self.last_score = None;
         for d in 1..=self.depth {
@@ -347,6 +353,7 @@ fn negamax(
     ctx:        &mut SearchContext,
     allow_null: bool,
 ) -> i32 {
+    ctx.nodes += 1;
     if depth == 0 {
         return quiescence(board, ply, alpha, beta, ctx);
     }
@@ -488,6 +495,7 @@ fn negamax(
 // evaluating positions at a tactical horizon.
 
 fn quiescence(board: &mut Board, ply: usize, mut alpha: i32, beta: i32, ctx: &mut SearchContext) -> i32 {
+    ctx.nodes += 1;
     let in_check = board.is_in_check();
 
     if !in_check {
@@ -599,5 +607,42 @@ mod tests {
         let mut b2 = b.clone();
         b2.make_move(mv);
         assert!(b2.is_in_check() || !generate_legal(&b2).is_empty());
+    }
+
+    /// Nodes-per-second benchmark. Run with:
+    ///   cargo test speed -- --nocapture --include-ignored
+    #[test]
+    #[ignore]
+    fn speed() {
+        use std::time::Instant;
+
+        // A mix of positions: opening, middlegame, endgame.
+        let positions = [
+            ("startpos",          "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"),
+            ("kiwipete",          "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1"),
+            ("middlegame",        "r1bq1rk1/pp2bppp/2n1pn2/3p4/3P4/2NBPN2/PPQ2PPP/R1B2RK1 w - - 4 10"),
+            ("endgame",           "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1"),
+        ];
+
+        let depth = 8;
+        let mut total_nodes = 0u64;
+        let mut total_ms    = 0u64;
+
+        for (name, fen) in &positions {
+            let b = board(fen);
+            let mut engine = AlphaBetaEngine::with_depth(depth);
+            let t0 = Instant::now();
+            engine.choose_move(&b);
+            let elapsed_ms = t0.elapsed().as_millis() as u64;
+            let nodes = engine.nodes_searched();
+            let nps   = if elapsed_ms > 0 { nodes * 1000 / elapsed_ms } else { nodes * 1000 };
+            println!("{name:<12}  depth {depth}  nodes {:>10}  time {:>6} ms  nps {:>10}", nodes, elapsed_ms, nps);
+            total_nodes += nodes;
+            total_ms    += elapsed_ms;
+        }
+
+        let avg_nps = if total_ms > 0 { total_nodes * 1000 / total_ms } else { total_nodes * 1000 };
+        println!("─────────────────────────────────────────────────────────────────");
+        println!("total               nodes {:>10}  time {:>6} ms  nps {:>10}", total_nodes, total_ms, avg_nps);
     }
 }
