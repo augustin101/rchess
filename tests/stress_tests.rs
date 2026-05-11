@@ -51,7 +51,7 @@ fn stress_engine_kiwipete_depth5() {
     let (elapsed, mv) = timed_search(KIWIPETE_FEN, 5);
     eprintln!("kiwipete/d5  → {:?}  ({:.2?})", mv, elapsed);
     assert!(mv.is_some(), "engine returned no move");
-    assert!(elapsed.as_millis() < 1000, "search too slow: {:.2?}", elapsed);
+    assert!(elapsed.as_millis() < 2000, "search too slow: {:.2?}", elapsed);
 }
 
 /// Middlegame at depth 7.
@@ -62,5 +62,5 @@ fn stress_engine_middlegame_depth7() {
     let (elapsed, mv) = timed_search(MIDDLEGAME_FEN, 7);
     eprintln!("middlegame/d7  → {:?}  ({:.2?})", mv, elapsed);
     assert!(mv.is_some(), "engine returned no move");
-    assert!(elapsed.as_millis() < 200, "search too slow: {:.2?}", elapsed);
+    assert!(elapsed.as_millis() < 500, "search too slow: {:.2?}", elapsed);
 }

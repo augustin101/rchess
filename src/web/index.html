@@ -413,6 +413,18 @@ textarea::placeholder { color: var(--muted); }
       <input type="range" id="depth-range" min="1" max="15" value="9">
     </div>
 
+    <div class="ctrl" id="nnue-ctrl">
+      <div class="lbl">NNUE Evaluation</div>
+      <div class="toggle-wrap">
+        <label class="toggle">
+          <input type="checkbox" id="nnue-toggle">
+          <span class="toggle-track"></span>
+          <span class="toggle-thumb"></span>
+        </label>
+        <span class="toggle-label" id="nnue-label">Off</span>
+      </div>
+    </div>
+
     <div class="ctrl">
       <div class="lbl">Book Openings</div>
       <div class="toggle-wrap">
@@ -662,6 +674,22 @@ function render() {
   // Sync engine selector
   document.getElementById('engine-sel').value = G.engine_type;
 
+  // Sync NNUE toggle
+  const nnueToggle = document.getElementById('nnue-toggle');
+  const nnueLabel  = document.getElementById('nnue-label');
+  const nnueCtrl   = document.getElementById('nnue-ctrl');
+  nnueToggle.checked    = G.use_nnue;
+  nnueLabel.textContent = G.use_nnue ? 'On' : 'Off';
+  if (!G.nnue_available) {
+    nnueCtrl.style.opacity = '0.35';
+    nnueCtrl.style.pointerEvents = 'none';
+    nnueCtrl.title = 'networks/nnue.bin not found — run: python training/export.py';
+  } else {
+    nnueCtrl.style.opacity = '';
+    nnueCtrl.style.pointerEvents = '';
+    nnueCtrl.title = '';
+  }
+
   // Sync book toggle
   const bookToggle = document.getElementById('book-toggle');
   const bookLabel  = document.getElementById('book-label');
@@ -767,6 +795,12 @@ document.getElementById('rand-range').addEventListener('input', e => {
   document.getElementById('rand-val').textContent = e.target.value;
 });
 
+// NNUE toggle label
+document.getElementById('nnue-toggle').addEventListener('change', () => {
+  const on = document.getElementById('nnue-toggle').checked;
+  document.getElementById('nnue-label').textContent = on ? 'On' : 'Off';
+});
+
 // Book toggle → grey randomness instantly
 document.getElementById('book-toggle').addEventListener('change', () => {
   const on = document.getElementById('book-toggle').checked;
@@ -787,6 +821,7 @@ function getSettings() {
     depth:       parseInt(document.getElementById('depth-range').value, 10),
     use_book:    document.getElementById('book-toggle').checked,
     randomness:  parseInt(document.getElementById('rand-range').value, 10),
+    use_nnue:    document.getElementById('nnue-toggle').checked,
   };
 }
 

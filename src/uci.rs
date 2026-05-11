@@ -145,7 +145,7 @@ pub fn run() {
         match line {
             "uci" => {
                 println!("id name rchess");
-                println!("id author Augustin");
+                println!("id author augustin101");
                 println!("option name Move Overhead type spin default 30 min 0 max 5000");
                 println!("option name Hash type spin default 16 min 1 max 1024");
                 println!("option name Threads type spin default 1 min 1 max 512");

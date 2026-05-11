@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use crate::core::bitboard::{lsb, EMPTY};
 use crate::core::board::Board;
 use crate::core::movegen::generate_pseudo_legal;
@@ -5,6 +7,7 @@ use crate::core::moves::Move;
 use crate::core::types::{Color, PieceType};
 use super::Engine;
 use super::eval::{static_eval, CHECKMATE_SCORE};
+use super::nnue;
 
 const NEG_INF: i32 = -(CHECKMATE_SCORE + 1);
 const POS_INF: i32 =   CHECKMATE_SCORE + 1;
@@ -140,6 +143,55 @@ impl HistoryTable {
     }
 }
 
+// ── Evaluator ─────────────────────────────────────────────────────────────────
+
+enum Evaluator {
+    Static,
+    Nnue { weights: Arc<nnue::Nnue>, stack: nnue::AccumulatorStack },
+}
+
+impl Evaluator {
+    #[inline]
+    fn eval_stm(&self, board: &Board) -> i32 {
+        match self {
+            Evaluator::Static => {
+                let raw = static_eval(board);
+                if board.side_to_move == Color::White { raw } else { -raw }
+            }
+            Evaluator::Nnue { weights, stack } => stack.evaluate(weights, board.side_to_move),
+        }
+    }
+
+    /// Refresh the accumulator at the root of a new search.
+    fn init(&mut self, board: &Board) {
+        let Evaluator::Nnue { weights, stack } = self else { return };
+        let w = Arc::clone(weights);
+        stack.init(&w, board);
+    }
+
+    /// Push + apply move delta (call BEFORE board.make_move).
+    #[inline]
+    fn push_move(&mut self, board: &Board, mv: Move) {
+        let Evaluator::Nnue { weights, stack } = self else { return };
+        let w = Arc::clone(weights);
+        stack.push_move(&w, board, mv);
+    }
+
+    /// Push for null moves (no piece changes).
+    #[inline]
+    fn push_null(&mut self) {
+        let Evaluator::Nnue { weights: _, stack } = self else { return };
+        stack.push_null();
+    }
+
+    /// Pop (call AFTER board.unmake_move).
+    #[inline]
+    fn pop(&mut self) {
+        let Evaluator::Nnue { weights: _, stack } = self else { return };
+        stack.pop();
+    }
+}
+
 // ── Search context (bundles mutable tables passed through the tree) ───────────
 
 struct SearchContext {
@@ -147,6 +199,7 @@ struct SearchContext {
     killers: KillerTable,
     history: HistoryTable,
     nodes:   u64,
+    eval:    Evaluator,
 }
 
 // ── Piece values for move ordering ────────────────────────────────────────────
@@ -226,15 +279,31 @@ impl AlphaBetaEngine {
     pub fn new() -> Self { Self::with_depth(5) }
 
     pub fn with_depth(depth: u32) -> Self {
+        Self::new_inner(depth, Evaluator::Static)
+    }
+
+    pub fn with_nnue(depth: u32, nnue: Arc<nnue::Nnue>) -> Self {
+        Self::new_inner(depth, Evaluator::Nnue {
+            weights: nnue,
+            stack:   nnue::AccumulatorStack::new(),
+        })
+    }
+
+    fn new_inner(depth: u32, eval: Evaluator) -> Self {
         let depth = depth.max(1);
+        let name = match &eval {
+            Evaluator::Static    => format!("Alpha-Beta (d={depth})"),
+            Evaluator::Nnue {..} => format!("Alpha-Beta NNUE (d={depth})"),
+        };
         AlphaBetaEngine {
             depth,
-            name: format!("Alpha-Beta (d={depth})"),
+            name,
             ctx: SearchContext {
                 tt:      TranspositionTable::new(),
                 killers: KillerTable::new(),
                 history: HistoryTable::new(),
                 nodes:   0,
+                eval,
             },
             last_score: None,
         }
@@ -242,7 +311,10 @@ impl AlphaBetaEngine {
 
     pub fn set_depth(&mut self, depth: u32) {
         self.depth = depth.max(1);
-        self.name = format!("Alpha-Beta (d={})", self.depth);
+        self.name = match &self.ctx.eval {
+            Evaluator::Static    => format!("Alpha-Beta (d={})", self.depth),
+            Evaluator::Nnue {..} => format!("Alpha-Beta NNUE (d={})", self.depth),
+        };
     }
 
     pub fn nodes_searched(&self) -> u64 { self.ctx.nodes }
@@ -258,6 +330,7 @@ impl AlphaBetaEngine {
         self.ctx.killers = KillerTable::new();
         self.ctx.history.age();
         self.ctx.nodes = 0;
+        self.ctx.eval.init(&b);
         let mut best = Move::NULL;
         self.last_score = None;
         for d in 1..=self.depth {
@@ -277,12 +350,13 @@ impl Engine for AlphaBetaEngine {
         self.ctx.killers = KillerTable::new();
         self.ctx.history.age();
         self.ctx.nodes = 0;
+        self.ctx.eval.init(&b);
         let mut best = Move::NULL;
         self.last_score = None;
         for d in 1..=self.depth {
             if let Some((mv, score)) = search_root(&mut b, d, &mut self.ctx) {
                 best = mv;
-                self.last_score = Some(score); // keep the deepest completed iteration
+                self.last_score = Some(score);
             }
         }
         if best.is_null() { None } else { Some(best) }
@@ -322,16 +396,19 @@ fn search_root(board: &mut Board, depth: u32, ctx: &mut SearchContext) -> Option
         scores.swap(i, bi);
 
         let mv = moves[i];
+        ctx.eval.push_move(board, mv);
         let state = board.make_move(mv);
 
         let king_bb = board.piece_bb(us, PieceType::King);
         if king_bb == EMPTY || board.is_attacked_by(lsb(king_bb), board.side_to_move) {
             board.unmake_move(mv, state);
+            ctx.eval.pop();
             continue;
         }
 
         let score = -negamax(board, depth - 1, 1, -POS_INF, -alpha, ctx, true);
         board.unmake_move(mv, state);
+        ctx.eval.pop();
 
         if score > alpha {
             alpha = score;
@@ -381,9 +458,11 @@ fn negamax(
     // (zugzwang risk).
     if allow_null && !in_check && depth >= NULL_MIN_DEPTH && has_non_pawn_material(board) {
         let r = if depth >= NULL_FULL_DEPTH { NULL_R_FULL } else { NULL_R_PARTIAL };
+        ctx.eval.push_null();
         let ns = board.make_null_move();
         let null_score = -negamax(board, depth - 1 - r, ply + 1, -beta, -beta + 1, ctx, false);
         board.unmake_null_move(ns);
+        ctx.eval.pop();
         if null_score >= beta {
             return beta;
         }
@@ -393,8 +472,7 @@ fn negamax(
     // At depth 1-2, if the static eval is far below alpha, quiet moves are
     // unlikely to recover; skip them.
     let futility_prunable = !in_check && depth <= FUTILITY_MAX_DEPTH && {
-        let raw = static_eval(board);
-        let eval = if board.side_to_move == Color::White { raw } else { -raw };
+        let eval   = ctx.eval.eval_stm(board);
         let margin = if depth == 1 { FUTILITY_MARGIN_1 } else { FUTILITY_MARGIN_2 };
         eval + margin < alpha
     };
@@ -428,11 +506,13 @@ fn negamax(
 
         if futility_prunable && is_quiet { continue; }
 
+        ctx.eval.push_move(board, mv);
         let state = board.make_move(mv);
 
         let king_bb = board.piece_bb(us, PieceType::King);
         if king_bb == EMPTY || board.is_attacked_by(lsb(king_bb), board.side_to_move) {
             board.unmake_move(mv, state);
+            ctx.eval.pop();
             continue;
         }
 
@@ -440,13 +520,9 @@ fn negamax(
         let gives_check = board.is_in_check();
 
         // ── Check extension ───────────────────────────────────────────────────
-        // Spend an extra ply when a move delivers check.
         let extension: u32 = if gives_check && ply < MAX_PLY - 1 { 1 } else { 0 };
 
         // ── Late Move Reductions (LMR) ────────────────────────────────────────
-        // Quiet moves late in the ordered list are unlikely to be the best
-        // move; search them at a reduced depth first and re-search only if
-        // they beat alpha.
         let score = if is_quiet && !gives_check && extension == 0
             && quiet_count >= LMR_MIN_QUIET && depth >= LMR_MIN_DEPTH
         {
@@ -462,6 +538,7 @@ fn negamax(
         };
 
         board.unmake_move(mv, state);
+        ctx.eval.pop();
 
         if is_quiet { quiet_count += 1; }
 
@@ -499,8 +576,7 @@ fn quiescence(board: &mut Board, ply: usize, mut alpha: i32, beta: i32, ctx: &mu
     let in_check = board.is_in_check();
 
     if !in_check {
-        let raw = static_eval(board);
-        let stand_pat = if board.side_to_move == Color::White { raw } else { -raw };
+        let stand_pat = ctx.eval.eval_stm(board);
         if stand_pat >= beta { return stand_pat; }
         alpha = alpha.max(stand_pat);
     }
@@ -545,16 +621,19 @@ fn quiescence(board: &mut Board, ply: usize, mut alpha: i32, beta: i32, ctx: &mu
             break;
         }
 
+        ctx.eval.push_move(board, mv);
         let state = board.make_move(mv);
         let king_bb = board.piece_bb(us, PieceType::King);
         if king_bb == EMPTY || board.is_attacked_by(lsb(king_bb), board.side_to_move) {
             board.unmake_move(mv, state);
+            ctx.eval.pop();
             continue;
         }
 
         has_legal = true;
         let score = -quiescence(board, ply + 1, -beta, -alpha, ctx);
         board.unmake_move(mv, state);
+        ctx.eval.pop();
 
         if score >= beta { return score; }
         alpha = alpha.max(score);
@@ -644,5 +723,70 @@ mod tests {
         let avg_nps = if total_ms > 0 { total_nodes * 1000 / total_ms } else { total_nodes * 1000 };
         println!("─────────────────────────────────────────────────────────────────");
         println!("total               nodes {:>10}  time {:>6} ms  nps {:>10}", total_nodes, total_ms, avg_nps);
+    }
+
+    /// NNUE nodes-per-second benchmark. Requires `networks/nnue.bin` (run from project root).
+    ///
+    /// Debug build (fast to run, NPS numbers unrealistic):
+    ///   cargo test speed_nnue -- --nocapture --include-ignored
+    ///
+    /// Release build (accurate NPS, recommended):
+    ///   cargo test --release speed_nnue -- --nocapture --include-ignored
+    #[test]
+    #[ignore]
+    fn speed_nnue() {
+        use std::time::Instant;
+        use std::sync::Arc;
+        use super::nnue;
+
+        let nnue = match nnue::Nnue::load("networks/nnue.bin") {
+            Ok(n)  => Arc::new(n),
+            Err(e) => { println!("speed_nnue: skipping — could not load networks/nnue.bin: {e}"); return; }
+        };
+
+        let positions = [
+            ("startpos",   "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"),
+            ("kiwipete",   "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1"),
+            ("middlegame", "r1bq1rk1/pp2bppp/2n1pn2/3p4/3P4/2NBPN2/PPQ2PPP/R1B2RK1 w - - 4 10"),
+            ("endgame",    "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1"),
+        ];
+
+        let depth = 6u32;
+        let mut total_nodes_s = 0u64;
+        let mut total_ms_s    = 0u64;
+        let mut total_nodes_n = 0u64;
+        let mut total_ms_n    = 0u64;
+
+        println!("{:<12}  {:^46}  {:^46}", "", "── Static eval ──────────────────────────", "── NNUE eval ────────────────────────────");
+        println!("{:<12}  {:>10}  {:>8}  {:>10}  {:>10}  {:>8}  {:>10}", "position", "nodes", "time ms", "nps", "nodes", "time ms", "nps");
+        println!("{}", "─".repeat(95));
+
+        for (name, fen) in &positions {
+            let b = board(fen);
+
+            let mut se = AlphaBetaEngine::with_depth(depth);
+            let t0 = Instant::now();
+            se.choose_move(&b);
+            let ms_s  = t0.elapsed().as_millis() as u64;
+            let nd_s  = se.nodes_searched();
+            let nps_s = if ms_s > 0 { nd_s * 1000 / ms_s } else { nd_s * 1000 };
+
+            let mut ne = AlphaBetaEngine::with_nnue(depth, nnue.clone());
+            let t1 = Instant::now();
+            ne.choose_move(&b);
+            let ms_n  = t1.elapsed().as_millis() as u64;
+            let nd_n  = ne.nodes_searched();
+            let nps_n = if ms_n > 0 { nd_n * 1000 / ms_n } else { nd_n * 1000 };
+
+            println!("{name:<12}  {nd_s:>10}  {ms_s:>8}  {nps_s:>10}  {nd_n:>10}  {ms_n:>8}  {nps_n:>10}");
+            total_nodes_s += nd_s;  total_ms_s += ms_s;
+            total_nodes_n += nd_n;  total_ms_n += ms_n;
+        }
+
+        let avg_s = if total_ms_s > 0 { total_nodes_s * 1000 / total_ms_s } else { total_nodes_s * 1000 };
+        let avg_n = if total_ms_n > 0 { total_nodes_n * 1000 / total_ms_n } else { total_nodes_n * 1000 };
+        println!("{}", "─".repeat(95));
+        println!("{:<12}  {:>10}  {:>8}  {:>10}  {:>10}  {:>8}  {:>10}",
+            "total", total_nodes_s, total_ms_s, avg_s, total_nodes_n, total_ms_n, avg_n);
     }
 }
