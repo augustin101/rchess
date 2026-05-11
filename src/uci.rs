@@ -150,6 +150,11 @@ pub fn run() {
                 println!("id author Augustin");
                 println!("option name Move Overhead type spin default 30 min 0 max 5000");
                 println!("option name Hash type spin default 16 min 1 max 1024");
+                println!("option name Threads type spin default 1 min 1 max 512");
+                println!("option name MultiPV type spin default 1 min 1 max 500");
+                println!("option name SyzygyPath type string default <empty>");
+                println!("option name UCI_ShowWDL type check default false");
+                println!("option name UCI_Chess960 type check default false");
                 println!("uciok");
             }
             "isready"    => println!("readyok"),
