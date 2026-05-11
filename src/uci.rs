@@ -6,7 +6,6 @@ use crate::core::movegen::generate_legal;
 use crate::core::moves::Move;
 use crate::core::types::{Color, PieceType, Square};
 use crate::engine::alpha_beta::AlphaBetaEngine;
-use crate::engine::opening_book::OpeningBook;
 
 const MAX_SEARCH_DEPTH: u32 = 12;
 
@@ -136,7 +135,6 @@ pub fn run() {
     let stdout = io::stdout();
 
     let mut engine = AlphaBetaEngine::with_depth(MAX_SEARCH_DEPTH);
-    let     book   = OpeningBook::load_default();
     let mut board  = Board::starting_position();
     let mut move_overhead_ms: u64 = 30;
 
@@ -181,14 +179,10 @@ pub fn run() {
                 }
             }
             _ if line.starts_with("go") => {
-                let mv = if let Some(book_mv) = book.probe(&board) {
-                    Some(book_mv)
-                } else {
-                    let go = parse_go(line);
-                    let (deadline, max_depth) = compute_deadline(&go, board.side_to_move, move_overhead_ms);
-                    engine.set_depth(max_depth);
-                    engine.choose_move_timed(&board, deadline)
-                };
+                let go = parse_go(line);
+                let (deadline, max_depth) = compute_deadline(&go, board.side_to_move, move_overhead_ms);
+                engine.set_depth(max_depth);
+                let mv = engine.choose_move_timed(&board, deadline);
                 let mv_str = mv.map_or_else(|| "0000".to_string(), |m| m.to_string());
                 println!("bestmove {mv_str}");
                 stdout.lock().flush().ok();
