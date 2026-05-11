@@ -7,7 +7,7 @@ use crate::core::moves::Move;
 use crate::core::types::{Color, PieceType, Square};
 use crate::engine::alpha_beta::AlphaBetaEngine;
 
-const MAX_SEARCH_DEPTH: u32 = 30;
+const MAX_SEARCH_DEPTH: u32 = 20;
 
 // ── Move parsing ──────────────────────────────────────────────────────────────
 
@@ -120,11 +120,11 @@ fn compute_deadline(go: &GoParams, side: Color, overhead_ms: u64) -> (Instant, u
         Color::White => (go.wtime.unwrap_or(30_000), go.winc),
         Color::Black => (go.btime.unwrap_or(30_000), go.binc),
     };
-    // Use ~1/20th of remaining time plus half the increment, minus overhead.
-    let budget = ((time_ms / 20) + inc_ms / 2)
+    // Use ~1/30th of remaining time plus half the increment, minus overhead.
+    let budget = ((time_ms / 30) + inc_ms / 2)
         .saturating_sub(overhead_ms)
         .max(1)
-        .min(time_ms.saturating_sub(overhead_ms + 20));
+        .min(time_ms.saturating_sub(overhead_ms + 10));
     (Instant::now() + Duration::from_millis(budget), MAX_SEARCH_DEPTH)
 }
 
@@ -179,10 +179,15 @@ pub fn run() {
                 }
             }
             _ if line.starts_with("go") => {
-                let go = parse_go(line);
-                let (deadline, max_depth) = compute_deadline(&go, board.side_to_move, move_overhead_ms);
-                engine.set_depth(max_depth);
-                let mv = engine.choose_move_timed(&board, deadline);
+                let legal = generate_legal(&board);
+                let mv = if legal.len() == 1 {
+                    Some(legal.as_slice()[0])
+                } else {
+                    let go = parse_go(line);
+                    let (deadline, max_depth) = compute_deadline(&go, board.side_to_move, move_overhead_ms);
+                    engine.set_depth(max_depth);
+                    engine.choose_move_timed(&board, deadline)
+                };
                 let mv_str = mv.map_or_else(|| "0000".to_string(), |m| m.to_string());
                 println!("bestmove {mv_str}");
                 stdout.lock().flush().ok();
