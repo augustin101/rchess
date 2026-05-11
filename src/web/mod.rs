@@ -57,7 +57,7 @@ fn make_engine(engine_type: &str, depth: u32, use_book: bool, randomness: u8) ->
 
 impl Game {
     fn new(human_color: Color) -> Self {
-        Self::from_board(human_color, "alpha-beta", 5, true, 30, Board::starting_position())
+        Self::from_board(human_color, "alpha-beta", 9, true, 30, Board::starting_position())
     }
 
     fn from_board(human_color: Color, engine_type: &str, depth: u32, use_book: bool, randomness: u8, board: Board) -> Self {
@@ -305,7 +305,7 @@ fn parse_engine_type(s: Option<&str>) -> &'static str {
 }
 
 fn parse_depth(d: Option<u32>) -> u32 {
-    d.unwrap_or(10).clamp(1, 15)
+    d.unwrap_or(9).clamp(1, 15)
 }
 
 fn parse_randomness(r: Option<u32>) -> u8 {
