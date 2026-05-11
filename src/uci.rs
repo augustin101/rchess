@@ -7,7 +7,7 @@ use crate::core::moves::Move;
 use crate::core::types::{Color, PieceType, Square};
 use crate::engine::alpha_beta::AlphaBetaEngine;
 
-const MAX_SEARCH_DEPTH: u32 = 12;
+const MAX_SEARCH_DEPTH: u32 = 30;
 
 // ── Move parsing ──────────────────────────────────────────────────────────────
 
@@ -120,11 +120,11 @@ fn compute_deadline(go: &GoParams, side: Color, overhead_ms: u64) -> (Instant, u
         Color::White => (go.wtime.unwrap_or(30_000), go.winc),
         Color::Black => (go.btime.unwrap_or(30_000), go.binc),
     };
-    // Use ~1/30th of remaining time plus half the increment, minus overhead.
-    let budget = ((time_ms / 30) + inc_ms / 2)
+    // Use ~1/20th of remaining time plus half the increment, minus overhead.
+    let budget = ((time_ms / 20) + inc_ms / 2)
         .saturating_sub(overhead_ms)
         .max(1)
-        .min(time_ms.saturating_sub(overhead_ms + 10));
+        .min(time_ms.saturating_sub(overhead_ms + 20));
     (Instant::now() + Duration::from_millis(budget), MAX_SEARCH_DEPTH)
 }
 
