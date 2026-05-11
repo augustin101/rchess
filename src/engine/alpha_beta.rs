@@ -237,6 +237,33 @@ impl AlphaBetaEngine {
             last_score: None,
         }
     }
+
+    pub fn set_depth(&mut self, depth: u32) {
+        self.depth = depth.max(1);
+        self.name = format!("Alpha-Beta (d={})", self.depth);
+    }
+
+    /// Iterative deepening with a wall-clock deadline. Completes each depth
+    /// before checking the clock, then stops if the deadline has passed.
+    pub fn choose_move_timed(
+        &mut self,
+        board: &Board,
+        deadline: std::time::Instant,
+    ) -> Option<Move> {
+        let mut b = board.clone();
+        self.ctx.killers = KillerTable::new();
+        self.ctx.history.age();
+        let mut best = Move::NULL;
+        self.last_score = None;
+        for d in 1..=self.depth {
+            if std::time::Instant::now() >= deadline { break; }
+            if let Some((mv, score)) = search_root(&mut b, d, &mut self.ctx) {
+                best = mv;
+                self.last_score = Some(score);
+            }
+        }
+        if best.is_null() { None } else { Some(best) }
+    }
 }
 
 impl Engine for AlphaBetaEngine {

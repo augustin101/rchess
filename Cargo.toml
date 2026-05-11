@@ -7,6 +7,10 @@ edition = "2024"
 name = "rchess"
 path = "src/main.rs"
 
+[[bin]]
+name = "rchess-uci"
+path = "src/bin/rchess_uci.rs"
+
 [lib]
 name = "rchess"
 path = "src/lib.rs"
