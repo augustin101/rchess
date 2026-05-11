@@ -8,7 +8,7 @@ use crate::core::types::{Color, PieceType, Square};
 use crate::engine::alpha_beta::AlphaBetaEngine;
 use crate::engine::opening_book::OpeningBook;
 
-const MAX_SEARCH_DEPTH: u32 = 15;
+const MAX_SEARCH_DEPTH: u32 = 12;
 
 // ── Move parsing ──────────────────────────────────────────────────────────────
 
@@ -104,7 +104,7 @@ fn parse_go(line: &str) -> GoParams {
     p
 }
 
-fn compute_deadline(go: &GoParams, side: Color) -> (Instant, u32) {
+fn compute_deadline(go: &GoParams, side: Color, overhead_ms: u64) -> (Instant, u32) {
     // Returns (deadline, max_depth).
     if go.infinite {
         return (Instant::now() + Duration::from_secs(3600), MAX_SEARCH_DEPTH);
@@ -113,8 +113,7 @@ fn compute_deadline(go: &GoParams, side: Color) -> (Instant, u32) {
         return (Instant::now() + Duration::from_secs(3600), d);
     }
     if let Some(ms) = go.movetime {
-        // Leave 10 ms for overhead.
-        let budget = ms.saturating_sub(10).max(1);
+        let budget = ms.saturating_sub(overhead_ms).max(1);
         return (Instant::now() + Duration::from_millis(budget), MAX_SEARCH_DEPTH);
     }
     // Incremental time control.
@@ -122,10 +121,11 @@ fn compute_deadline(go: &GoParams, side: Color) -> (Instant, u32) {
         Color::White => (go.wtime.unwrap_or(30_000), go.winc),
         Color::Black => (go.btime.unwrap_or(30_000), go.binc),
     };
-    // Use ~1/30th of remaining time plus half the increment.
+    // Use ~1/30th of remaining time plus half the increment, minus overhead.
     let budget = ((time_ms / 30) + inc_ms / 2)
-        .max(50)
-        .min(time_ms.saturating_sub(50));
+        .saturating_sub(overhead_ms)
+        .max(1)
+        .min(time_ms.saturating_sub(overhead_ms + 10));
     (Instant::now() + Duration::from_millis(budget), MAX_SEARCH_DEPTH)
 }
 
@@ -138,6 +138,7 @@ pub fn run() {
     let mut engine = AlphaBetaEngine::with_depth(MAX_SEARCH_DEPTH);
     let     book   = OpeningBook::load_default();
     let mut board  = Board::starting_position();
+    let mut move_overhead_ms: u64 = 30;
 
     for line in stdin.lock().lines() {
         let line = match line { Ok(l) => l, Err(_) => break };
@@ -147,18 +148,28 @@ pub fn run() {
             "uci" => {
                 println!("id name rchess");
                 println!("id author Augustin");
+                println!("option name Move Overhead type spin default 30 min 0 max 5000");
+                println!("option name Hash type spin default 16 min 1 max 1024");
                 println!("uciok");
             }
             "isready"    => println!("readyok"),
             "ucinewgame" => {
                 engine = AlphaBetaEngine::with_depth(MAX_SEARCH_DEPTH);
                 board  = Board::starting_position();
-                // book is stateless; no reset needed
             }
-            "quit"       => break,
-            // "stop" is meaningful only during async search; our search is
-            // synchronous so by the time we read "stop" we've already replied.
-            "stop"       => {}
+            "quit" => break,
+            "stop" => {}
+            _ if line.starts_with("setoption") => {
+                // setoption name <Name> value <Value>
+                if let Some(rest) = line.strip_prefix("setoption name ") {
+                    if let Some(val_str) = rest.strip_prefix("Move Overhead value ") {
+                        if let Ok(v) = val_str.trim().parse::<u64>() {
+                            move_overhead_ms = v;
+                        }
+                    }
+                    // Hash option: ignored for now (TT size is fixed)
+                }
+            }
             _ if line.starts_with("position") => {
                 if let Some(b) = parse_position(line) {
                     board = b;
@@ -169,7 +180,7 @@ pub fn run() {
                     Some(book_mv)
                 } else {
                     let go = parse_go(line);
-                    let (deadline, max_depth) = compute_deadline(&go, board.side_to_move);
+                    let (deadline, max_depth) = compute_deadline(&go, board.side_to_move, move_overhead_ms);
                     engine.set_depth(max_depth);
                     engine.choose_move_timed(&board, deadline)
                 };
