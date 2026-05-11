@@ -35,17 +35,17 @@ const BISHOP_PAIR_MG: i32 = 25;
 const BISHOP_PAIR_EG: i32 = 50; // much stronger in open endgames
 
 // King safety (middlegame only — EG king activity is captured by KING_PST_EG)
-const PAWN_SHIELD_MG:    i32 = 10; // per pawn in the king's immediate pawn shield
-const KING_OPEN_FILE_MG: i32 = -25; // king on a file with no pawns
+const PAWN_SHIELD_MG:    i32 = 15; // per pawn in the king's immediate pawn shield
+const KING_OPEN_FILE_MG: i32 = -40; // king on a file with no pawns
 
 // Mobility: bonus per extra attacked square (non-own)
-const MOB_KNIGHT: i32 = 4;
-const MOB_BISHOP: i32 = 3;
-const MOB_ROOK:   i32 = 2;
-const MOB_QUEEN:  i32 = 1;
+const MOB_KNIGHT: i32 = 7;
+const MOB_BISHOP: i32 = 5;
+const MOB_ROOK:   i32 = 3;
+const MOB_QUEEN:  i32 = 2;
 
 // Check pressure
-const CHECK_PENALTY: i32 = 40;
+const CHECK_PENALTY: i32 = 60;
 
 // ── Game phase ────────────────────────────────────────────────────────────────
 
