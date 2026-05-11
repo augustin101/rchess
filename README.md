@@ -1,36 +1,56 @@
 # rchess
 
-A chess engine and web server written in Rust. Play against a computer opponent in your browser.
+A small personal chess engine written in Rust. It includes a browser-based UI to play against it locally, and a UCI-compatible binary for use with chess GUIs or bot frameworks like [lichess-bot](https://github.com/lichess-bot-devs/lichess-bot).
 
-## Playing
+## Running
 
+**Web UI** — play against the engine in your browser:
 ```bash
 cargo run --release
+# then open http://localhost:3000
 ```
 
-Then open **http://localhost:3000** in your browser. Click a piece to see legal moves, click a destination square to move. The engine replies automatically. Promotions default to queen; a picker appears for other choices.
+**UCI engine** — for chess GUIs or lichess-bot:
+```bash
+cargo build --release --bin rchess-uci
+# binary at target/release/rchess-uci
+```
 
-You can choose to play as Black or restart the game at any time via the in-page controls.
+## Tests
+
+```bash
+cargo test                        # run all fast tests
+cargo test -- --include-ignored   # include slow perft depths (≥5)
+cargo test perft_start_d4         # run a specific perft test by name
+```
 
 ## Architecture
 
 ```
 src/
 ├── core/
-│   ├── types.rs      – Square, Color, PieceType, Piece primitives
-│   ├── bitboard.rs   – Bitboard newtype + shift helpers
-│   ├── attacks.rs    – Pre-computed attack tables (magic bitboards for sliders)
-│   ├── board.rs      – Hybrid board: bitboards + mailbox; FEN I/O; make/unmake
-│   ├── moves.rs      – Move encoding (u16), MoveList (stack-allocated)
-│   ├── movegen.rs    – Pseudo-legal + legal move generation
-│   ├── san.rs        – Move → Standard Algebraic Notation
-│   └── perft.rs      – Bulk-counting perft
+│   ├── types.rs        – Square, Color, PieceType, Piece primitives
+│   ├── bitboard.rs     – Bitboard newtype + shift/pop helpers
+│   ├── attacks.rs      – Pre-computed attack tables (magic bitboards for sliders)
+│   ├── board.rs        – Hybrid board: bitboards + mailbox; FEN I/O; make/unmake
+│   ├── moves.rs        – Move encoding (u16), MoveList (stack-allocated)
+│   ├── movegen.rs      – Pseudo-legal + legal move generation
+│   ├── zobrist.rs      – Incremental Zobrist hashing
+│   ├── san.rs          – Move → Standard Algebraic Notation
+│   └── perft.rs        – Bulk-counting perft for move generation testing
 ├── engine/
-│   ├── mod.rs        – Engine trait
-│   └── random.rs     – RandomEngine (xorshift64 pick)
+│   ├── mod.rs          – Engine trait
+│   ├── eval.rs         – Tapered static evaluation (material, PST, pawn structure,
+│   │                     mobility, king safety, rook bonuses, bishop pair)
+│   ├── pst.rs          – Piece-square tables (middlegame + endgame)
+│   ├── alpha_beta.rs   – Iterative-deepening alpha-beta with TT, killers,
+│   │                     history, null-move, futility pruning, LMR, quiescence
+│   ├── opening_book.rs – Polyglot opening book reader
+│   └── random.rs       – RandomEngine (used for testing)
+├── uci.rs              – UCI protocol interface
 └── web/
-    ├── mod.rs        – Axum router + game state (REST API)
-    └── index.html    – Single-page frontend (vanilla JS)
+    ├── mod.rs          – Axum REST API + game state
+    └── index.html      – Single-page browser UI (vanilla JS)
 ```
 
 ### Board representation
@@ -41,27 +61,39 @@ src/
 
 Squares are indexed a1=0 … h8=63 (bit N in a `Bitboard` = `Square(N)`).
 
-### Attack generation
+### Move generation
 
-Slider attacks (rook, bishop, queen) use **magic bitboards**: each square has a `MagicEntry { mask, magic, shift, offset }` that maps an occupancy subset to an index into a flat pre-computed table (~102 K rook entries, ~5.3 K bishop entries). Leaper tables (pawn, knight, king) are plain arrays.
+Slider attacks (rook, bishop, queen) use **magic bitboards**: each square has a `MagicEntry { mask, magic, shift, offset }` indexing into a flat pre-computed table (~102 K rook entries, ~5.3 K bishop entries). Leaper tables (pawn, knight, king) are plain arrays. `generate_pseudo_legal` produces geometrically valid moves; `generate_legal` filters them by verifying the king is not left in check.
 
 ### Move encoding
 
-`Move(u16)` packs from (6 bits), to (6 bits), promotion piece (2 bits), flag (2 bits: Normal / Promo / EnPassant / Castling). `MoveList` is a stack-allocated `[Move; 256]` — no heap allocation in the hot path.
+`Move(u16)` packs from-square (6 bits), to-square (6 bits), promotion piece (2 bits), and flag (2 bits: Normal / Promo / EnPassant / Castling). `MoveList` is a stack-allocated `[Move; 256]` — no heap allocation in the hot path.
 
-### Engine
+### Search
 
-The current engine (`RandomEngine`) picks a uniformly random legal move. The `Engine` trait makes it straightforward to swap in a stronger implementation.
+Iterative-deepening alpha-beta with:
+- Transposition table (1M entries, ~24 MB)
+- Move ordering: TT move → promotions → MVV-LVA captures → killer moves → history heuristic
+- Null-move pruning
+- Futility pruning (depth 1–2)
+- Late Move Reductions (LMR)
+- Check extensions
+- Quiescence search
 
-## Development
+### Evaluation
 
-```bash
-cargo build                       # debug build
-cargo test                        # run fast tests
-cargo test -- --include-ignored   # include slow perft depths (≥5)
-cargo test perft_start_d4         # run a specific perft test
-```
+Tapered evaluation interpolating between middlegame and endgame scores based on remaining material:
+- Material + piece-square tables
+- Pawn structure (doubled, isolated, islands, passed pawns)
+- Rook bonuses (open/semi-open files, 7th rank)
+- Bishop pair
+- King safety (pawn shield, open file exposure)
+- Mobility (squares attacked per piece type)
 
 ## Requirements
 
-- Rust 1.85+ (edition 2024)
+Rust 1.85+ (edition 2024)
+
+## License
+
+MIT — see [LICENSE](LICENSE)
