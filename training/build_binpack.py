@@ -24,13 +24,19 @@ import argparse
 import json
 import multiprocessing as mp
 import os
+import threading
 import time
 from pathlib import Path
 
 import chess
 import numpy as np
 import pyarrow.parquet as pq
-from tqdm import tqdm
+from rich.console import Console
+from rich.live import Live
+from rich.progress import (
+    BarColumn, MofNCompleteColumn, Progress, SpinnerColumn,
+    TaskProgressColumn, TextColumn, TimeElapsedColumn, TimeRemainingColumn,
+)
 
 # ── Record dtype ──────────────────────────────────────────────────────────────
 
@@ -141,15 +147,24 @@ def _extract_features_batch(
 def _process_file(args: tuple) -> tuple[int, int, int]:
     """Worker: read one parquet file → write one shard .bin file.
     Returns (n_written, n_skipped, n_capture_skips)."""
-    filepath, out_path, max_rows, seed, worker_id = args
+    filepath, out_path, max_rows, seed, worker_id, q = args
 
     rng = np.random.default_rng(seed)
 
     try:
         pf = pq.ParquetFile(filepath)
     except Exception as exc:
-        print(f"[worker {worker_id}] ERROR opening {filepath}: {exc}")
+        q.put(('error', worker_id, str(exc)))
         return 0, 0, 0
+
+    # Report total rows so the progress bar has a known target
+    try:
+        n_total = pf.metadata.num_rows
+        if max_rows is not None:
+            n_total = min(n_total, max_rows)
+    except Exception:
+        n_total = None
+    q.put(('start', worker_id, n_total, filepath.name))
 
     has_move = 'line' in set(pf.schema_arrow.names)
     columns  = ['fen', 'cp', 'depth'] + (['line'] if has_move else [])
@@ -182,93 +197,144 @@ def _process_file(args: tuple) -> tuple[int, int, int]:
                     moves  = moves[:remaining]
 
             rows_seen += len(fens)
-            n_skipped += len(fens)   # will subtract valid below
+            n_skipped += len(fens)
 
             records, batch_capture_skips = _extract_features_batch(fens, cps, depths, moves)
             n_capture_skips += batch_capture_skips
             if len(records):
-                rng.shuffle(records)  # chunk-level shuffle
+                rng.shuffle(records)
                 fout.write(records.tobytes())
                 n_written += len(records)
                 n_skipped -= len(records)
 
+            q.put(('advance', worker_id, len(fens)))
+
     tmp_path.rename(out_path)
+    q.put(('done', worker_id))
     return n_written, n_skipped, n_capture_skips
+
+
+# ── Filename display helper ───────────────────────────────────────────────────
+
+_FNAME_WIDTH = 34
+
+def _fname(name: str) -> str:
+    return (name[:_FNAME_WIDTH - 1] + '…') if len(name) > _FNAME_WIDTH else name.ljust(_FNAME_WIDTH)
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def build(args: argparse.Namespace) -> None:
-    data_dir   = Path(args.data_dir)
-    out_dir    = Path(args.out_dir)
+    console       = Console()
+    data_dir      = Path(args.data_dir)
+    out_dir       = Path(args.out_dir)
     parquet_files = sorted(data_dir.glob('*.parquet'))
 
     if not parquet_files:
         raise FileNotFoundError(f"No .parquet files found in {data_dir}")
 
-    # Inspect first file to detect optional columns
     try:
         _schema = pq.ParquetFile(parquet_files[0]).schema_arrow.names
         has_move_col = 'line' in set(_schema)
     except Exception:
         has_move_col = False
 
-    print(f"Found {len(parquet_files)} parquet files in {data_dir}")
+    console.print(f"Found [cyan]{len(parquet_files)}[/] parquet files in [dim]{data_dir}[/]")
     if args.max_rows:
-        print(f"  ↳ smoke-test mode: {args.max_rows:,} rows per file")
-    print(f"Output directory : {out_dir}")
-    print(f"Workers          : {args.workers}")
-    print(f"Filters")
-    print(f"  depth >= {MIN_DEPTH}       (shallow evals skipped)")
-    print(f"  |cp|  <= {MAX_ABS_CP}      (extreme evals skipped)")
-    print(f"  no capture on main line: {'yes' if has_move_col else 'no  (no move column in parquet)'}")
-    print()
+        console.print(f"  ↳ smoke-test mode: {args.max_rows:,} rows per file")
+    console.print(f"Output   : [dim]{out_dir}[/]   Workers: [cyan]{args.workers}[/]")
+    console.print(f"Filters  : depth >= {MIN_DEPTH}, |cp| <= {MAX_ABS_CP}"
+                  + ("[dim], no capture on main line[/]" if has_move_col else ""))
+    console.print()
 
     shard_dir = out_dir / 'shards'
     shard_dir.mkdir(parents=True, exist_ok=True)
-
-    worker_args = [
-        (
-            filepath,
-            shard_dir / f'shard_{i:02d}.bin',
-            args.max_rows,
-            args.seed + i,
-            i,
-        )
-        for i, filepath in enumerate(parquet_files)
-    ]
-
-    t0 = time.time()
-    total_written       = 0
-    total_skipped       = 0
-    total_capture_skips = 0
-
     n_workers = min(args.workers, len(parquet_files))
-    with mp.Pool(n_workers) as pool:
-        results = list(tqdm(
-            pool.imap(_process_file, worker_args),
-            total=len(parquet_files),
-            desc='Shards',
-            unit='file',
-        ))
 
-    for written, skipped, capture_skips in results:
-        total_written       += written
-        total_skipped       += skipped
-        total_capture_skips += capture_skips
+    # ── Progress display ──────────────────────────────────────────────────────
+    progress = Progress(
+        SpinnerColumn(),
+        TextColumn('{task.description}'),
+        BarColumn(bar_width=28),
+        TaskProgressColumn(),
+        MofNCompleteColumn(),
+        TimeElapsedColumn(),
+        TimeRemainingColumn(),
+        console=console,
+    )
+    file_tasks = {
+        i: progress.add_task(f'[dim]{_fname(fp.name)}', total=None, start=False)
+        for i, fp in enumerate(parquet_files)
+    }
+    overall_task = progress.add_task(
+        f'[bold blue]Total  ({len(parquet_files)} files)',
+        total=len(parquet_files),
+    )
+
+    # ── Queue + listener thread ───────────────────────────────────────────────
+    t0 = time.time()
+    total_written = total_skipped = total_capture_skips = 0
+
+    with mp.Manager() as manager:
+        q = manager.Queue()
+
+        worker_args = [
+            (filepath, shard_dir / f'shard_{i:02d}.bin', args.max_rows, args.seed + i, i, q)
+            for i, filepath in enumerate(parquet_files)
+        ]
+
+        def _listen() -> None:
+            while True:
+                msg = q.get()
+                if msg[0] == 'start':
+                    _, wid, n_total, fname = msg
+                    progress.update(file_tasks[wid], total=n_total,
+                                    description=f'[cyan]{_fname(fname)}')
+                    progress.start_task(file_tasks[wid])
+                elif msg[0] == 'advance':
+                    _, wid, n = msg
+                    progress.advance(file_tasks[wid], n)
+                elif msg[0] == 'done':
+                    _, wid = msg
+                    t = progress.tasks[file_tasks[wid]]
+                    progress.update(file_tasks[wid],
+                                    completed=t.total or t.completed,
+                                    description=f'[green]✓ {_fname(parquet_files[wid].name)}')
+                    progress.advance(overall_task)
+                elif msg[0] == 'error':
+                    _, wid, err = msg
+                    progress.update(file_tasks[wid],
+                                    description=f'[red]✗ {_fname(parquet_files[wid].name)}')
+                    progress.advance(overall_task)
+                    console.print(f'[red]ERROR[/] worker {wid}: {err}')
+                elif msg[0] == 'stop':
+                    break
+
+        listener = threading.Thread(target=_listen, daemon=True)
+        listener.start()
+
+        with Live(progress, console=console, refresh_per_second=4):
+            with mp.Pool(n_workers) as pool:
+                for written, skipped, captures in pool.imap(_process_file, worker_args):
+                    total_written       += written
+                    total_skipped       += skipped
+                    total_capture_skips += captures
+
+        q.put(('stop',))
+        listener.join(timeout=5)
 
     elapsed    = time.time() - t0
     shard_size = total_written * RECORD_SIZE
     total_seen = total_written + total_skipped
     pass_rate  = total_written / max(1, total_seen) * 100
 
-    print(f"\nDone in {elapsed/60:.1f} min")
-    print(f"  Written         : {total_written:,} records  ({shard_size / 1e9:.1f} GB)")
-    print(f"  Skipped (total) : {total_skipped:,}  (pass rate {pass_rate:.1f}%)")
+    console.print(f"\n[bold green]Done[/] in {elapsed / 60:.1f} min")
+    console.print(f"  Written         : [cyan]{total_written:,}[/] records  ({shard_size / 1e9:.1f} GB)")
+    console.print(f"  Skipped (total) : {total_skipped:,}  (pass rate [cyan]{pass_rate:.1f}%[/])")
     if has_move_col:
         capture_pct = total_capture_skips / max(1, total_seen) * 100
-        print(f"    of which capture on main line: {total_capture_skips:,}  ({capture_pct:.1f}%)")
-    print(f"  Shards          : {shard_dir}")
+        console.print(f"    of which capture on main line: {total_capture_skips:,}  ({capture_pct:.1f}%)")
+    console.print(f"  Shards          : [dim]{shard_dir}[/]")
 
     meta = {
         'filters': {
@@ -291,7 +357,7 @@ def build(args: argparse.Namespace) -> None:
     }
     meta_path = out_dir / 'binpack_meta.json'
     meta_path.write_text(json.dumps(meta, indent=2))
-    print(f"  Metadata        : {meta_path}")
+    console.print(f"  Metadata        : [dim]{meta_path}[/]")
 
 
 if __name__ == '__main__':
