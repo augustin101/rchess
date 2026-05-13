@@ -123,6 +123,8 @@ def save_plots(
     lrs:          list[float],
     plot_dir:     Path,
     label:        str,
+    x_values:     list[float] | None = None,
+    x_label:      str = 'Epoch',
 ) -> None:
     plot_dir.mkdir(parents=True, exist_ok=True)
 
@@ -134,26 +136,27 @@ def save_plots(
         w  = min(200, max(10, len(step_losses) // 30))
         ax.plot(_smooth(step_losses, w), linewidth=0.8, color='steelblue', label='smoothed')
         ax.set_xlabel('Step')
-        ax.set_ylabel('BCE loss')
+        ax.set_ylabel('Loss')
         ax.set_title('Train loss (smoothed)')
         ax.legend(fontsize=8)
     ax.grid(True, alpha=0.3)
 
     ax = axes[1]
     if epoch_train:
-        ep = list(range(1, len(epoch_train) + 1))
-        ax.plot(ep, epoch_train, marker='o', label='train', color='steelblue')
-        ax.plot(ep, epoch_val,   marker='s', label='val',   color='tomato')
-        ax.set_xlabel('Epoch')
-        ax.set_ylabel('BCE loss')
+        xs = x_values if x_values is not None else list(range(1, len(epoch_train) + 1))
+        ax.plot(xs, epoch_train, marker='o', label='train', color='steelblue')
+        ax.plot(xs, epoch_val,   marker='s', label='val',   color='tomato')
+        ax.set_xlabel(x_label)
+        ax.set_ylabel('Loss')
         ax.set_title('Train vs Validation loss')
         ax.legend()
     ax.grid(True, alpha=0.3)
 
     ax = axes[2]
     if lrs:
-        ax.plot(list(range(1, len(lrs) + 1)), lrs, marker='o', color='seagreen')
-        ax.set_xlabel('Epoch')
+        xs = x_values if x_values is not None else list(range(1, len(lrs) + 1))
+        ax.plot(xs, lrs, marker='o', color='seagreen')
+        ax.set_xlabel(x_label)
         ax.set_ylabel('Learning rate')
         ax.set_title('LR schedule')
         ax.set_yscale('log')
@@ -161,7 +164,7 @@ def save_plots(
 
     plt.tight_layout()
     plt.savefig(plot_dir / 'latest.png', dpi=120, bbox_inches='tight')
-    if 'epoch' in label:
+    if not label.startswith('step_'):
         plt.savefig(plot_dir / f'{label}.png', dpi=120, bbox_inches='tight')
     plt.close()
 
@@ -207,6 +210,7 @@ def _train_step(
     pred = model(wf, bf, stm)
     loss = loss_fn(pred, cp)
     loss.backward()
+    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
     optimizer.step()
     return loss.item(), batch_size / (time.perf_counter() - t0)
 
@@ -218,22 +222,23 @@ def _run_validation(model: nn.Module, loader, device: torch.device) -> float:
     return val_loss
 
 
-def _print_epoch_summary(
-    console:      Console,
-    epoch:        int,
-    total_epochs: int,
-    avg_train:    float,
-    last_val:     float,
-    lr_now:       float,
-    elapsed:      float,
-    is_best:      bool,
+def _print_checkpoint_summary(
+    console:   Console,
+    label:     str,
+    avg_train: float,
+    last_val:  float,
+    lr_now:    float,
+    elapsed:   float,
+    is_best:   bool,
+    positions: int | None = None,
 ) -> None:
     best_marker  = '  [bold green]★ best[/]' if is_best else ''
     gap          = last_val - avg_train
     gap_color    = 'red' if gap > 0.005 else 'green'
     overfit_warn = '  [bold red]⚠ overfit[/]' if gap > 0.01 else ''
+    pos_str      = f'  pos=[cyan]{positions / 1e6:.1f}M[/]' if positions is not None else ''
     console.print(
-        f'[bold]Epoch {epoch}/{total_epochs}[/]  '
+        f'[bold]{label}[/]{pos_str}  '
         f'train=[yellow]{avg_train:.5f}[/]  '
         f'val=[green]{last_val:.5f}[/]  '
         f'Δ=[{gap_color}]{gap:+.5f}[/]  '
@@ -241,6 +246,30 @@ def _print_epoch_summary(
         f'[dim]{elapsed:.0f}s[/]'
         f'{best_marker}{overfit_warn}'
     )
+
+
+# ── Resume helper ─────────────────────────────────────────────────────────────
+
+def _save_resume(path: Path, *, model, optimizer, scheduler, epoch, vepoch,
+                 total_positions, positions_at_last_vckpt,
+                 best_val, last_val, avg_train,
+                 ckpt_train, ckpt_val, ckpt_lrs, ckpt_pos) -> None:
+    torch.save({
+        'epoch':                   epoch,
+        'vepoch':                  vepoch,
+        'total_positions':         total_positions,
+        'positions_at_last_vckpt': positions_at_last_vckpt,
+        'model':                   model.state_dict(),
+        'optimizer':               optimizer.state_dict(),
+        'scheduler':               scheduler.state_dict(),
+        'best_val':                best_val,
+        'last_val':                last_val,
+        'train_loss':              avg_train,
+        'ckpt_train':              ckpt_train,
+        'ckpt_val':                ckpt_val,
+        'ckpt_lrs':                ckpt_lrs,
+        'ckpt_pos':                ckpt_pos,
+    }, path)
 
 
 # ── Training ──────────────────────────────────────────────────────────────────
@@ -258,7 +287,7 @@ def train(args: argparse.Namespace) -> None:
     approx_steps = max(1, len(train_loader.dataset) // args.batch)
 
     model     = NNUE().to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-5)
     loss_fn   = MixedLoss(alpha=args.loss_alpha)
 
     # Hold LR flat for lr_flat_frac of training, then cosine-decay to 0.
@@ -274,12 +303,36 @@ def train(args: argparse.Namespace) -> None:
     recent_losses: deque[float] = deque(maxlen=300)
     pps_history:   deque[float] = deque(maxlen=30)
     step_losses: list[float] = []
-    epoch_train: list[float] = []
-    epoch_val:   list[float] = []
-    lrs:         list[float] = []
+    ckpt_train:  list[float] = []
+    ckpt_val:    list[float] = []
+    ckpt_lrs:    list[float] = []
+    ckpt_pos:    list[float] = []
     last_val = float('nan')
     best_val = float('inf')
     lr_now   = args.lr
+
+    vepoch                  = 0
+    total_positions         = 0
+    positions_at_last_vckpt = 0
+    start_epoch             = 1
+
+    # ── Resume from checkpoint ────────────────────────────────────────────────
+    if args.resume:
+        state = torch.load(args.resume, map_location='cpu', weights_only=False)
+        model.load_state_dict(state['model'])
+        optimizer.load_state_dict(state['optimizer'])
+        if 'scheduler' in state:
+            scheduler.load_state_dict(state['scheduler'])
+        start_epoch             = state.get('epoch', 0) + 1
+        vepoch                  = state.get('vepoch', 0)
+        total_positions         = state.get('total_positions', 0)
+        positions_at_last_vckpt = state.get('positions_at_last_vckpt', 0)
+        best_val                = state.get('best_val', float('inf'))
+        last_val                = state.get('last_val', float('nan'))
+        ckpt_train              = state.get('ckpt_train', [])
+        ckpt_val                = state.get('ckpt_val', [])
+        ckpt_lrs                = state.get('ckpt_lrs', [])
+        ckpt_pos                = state.get('ckpt_pos', [])
 
     epoch_prog = Progress(
         SpinnerColumn(),
@@ -300,6 +353,9 @@ def train(args: argparse.Namespace) -> None:
     total_task = total_prog.add_task('Epochs', total=args.epochs)
 
     console = Console()
+    if args.resume:
+        console.print(f'Resumed from [cyan]{args.resume}[/] — starting epoch [cyan]{start_epoch}[/]  '
+                      f'best_val=[green]{best_val:.5f}[/]\n')
     console.print(
         f'[bold]rchess NNUE[/]  device=[cyan]{device}[/]  '
         f'params=[cyan]{sum(p.numel() for p in model.parameters()):,}[/]  '
@@ -307,10 +363,17 @@ def train(args: argparse.Namespace) -> None:
         f'lr=[cyan]{args.lr}[/]  '
         f'epochs=[cyan]{args.epochs}[/]'
     )
-    console.print(f'Plots → [dim]{plot_dir}/latest.png[/]  (updated every {args.plot_steps} steps)\n')
+    if args.plot_steps > 0:
+        console.print(f'Plots → [dim]{plot_dir}/latest.png[/]  (updated every {args.plot_steps} steps)\n')
+    else:
+        console.print(f'Plots → [dim]{plot_dir}/latest.png[/]  (updated at each checkpoint)\n')
+
+    # Fast-forward total progress bar if resuming
+    for _ in range(start_epoch - 1):
+        total_prog.advance(total_task)
 
     with Live(console=console, refresh_per_second=4, transient=False) as live:
-        for epoch in range(1, args.epochs + 1):
+        for epoch in range(start_epoch, args.epochs + 1):
             model.train()
             epoch_loss  = 0.0
             n_batches   = 0
@@ -335,7 +398,39 @@ def train(args: argparse.Namespace) -> None:
                 step_losses.append(loss_val)
                 epoch_loss += loss_val
                 n_batches  += 1
+                total_positions += args.batch
                 epoch_prog.advance(epoch_task)
+
+                # ── Virtual epoch checkpoint ──────────────────────────────────
+                if (args.virtual_epoch_size > 0
+                        and (total_positions - positions_at_last_vckpt) >= args.virtual_epoch_size):
+                    positions_at_last_vckpt = total_positions
+                    vepoch += 1
+                    avg_so_far = epoch_loss / max(1, n_batches)
+                    last_val   = _run_validation(model, val_loader, device)
+                    is_best    = last_val < best_val
+                    if is_best:
+                        best_val = last_val
+                    ckpt_train.append(avg_so_far)
+                    ckpt_val.append(last_val)
+                    ckpt_lrs.append(lr_now)
+                    ckpt_pos.append(total_positions / 1e6)
+                    vckpt = dict(epoch=epoch, vepoch=vepoch, model=model.state_dict(),
+                                 train_loss=avg_so_far, val_loss=last_val,
+                                 total_positions=total_positions)
+                    torch.save(vckpt, CHECKPOINT_DIR / f'vepoch_{vepoch:04d}.pt')
+                    if is_best:
+                        torch.save(vckpt, CHECKPOINT_DIR / 'best.pt')
+                    _print_checkpoint_summary(
+                        console, f'E{epoch}·V{vepoch}',
+                        avg_so_far, last_val, lr_now,
+                        time.perf_counter() - epoch_start, is_best,
+                        positions=total_positions,
+                    )
+                    save_plots(step_losses, ckpt_train, ckpt_val, ckpt_lrs,
+                               plot_dir, f'vepoch_{vepoch:04d}',
+                               x_values=ckpt_pos, x_label='Positions (M)')
+                    refresh(step)
 
                 if args.val_steps > 0 and step % args.val_steps == 0:
                     last_val = _run_validation(model, val_loader, device)
@@ -350,8 +445,10 @@ def train(args: argparse.Namespace) -> None:
                 if step % args.display_steps == 0:
                     refresh(step)
 
-                if step % args.plot_steps == 0:
-                    save_plots(step_losses, epoch_train, epoch_val, lrs, plot_dir, f'step_{step}')
+                if args.plot_steps > 0 and step % args.plot_steps == 0:
+                    save_plots(step_losses, ckpt_train, ckpt_val, ckpt_lrs,
+                               plot_dir, f'step_{step}',
+                               x_values=ckpt_pos or None, x_label='Positions (M)')
 
             # ── End of epoch ─────────────────────────────────────────────────
             scheduler.step()
@@ -364,20 +461,39 @@ def train(args: argparse.Namespace) -> None:
             if is_best:
                 best_val = last_val
 
-            epoch_train.append(avg_train)
-            epoch_val.append(last_val)
-            lrs.append(lr_now)
+            ckpt_train.append(avg_train)
+            ckpt_val.append(last_val)
+            ckpt_lrs.append(lr_now)
+            ckpt_pos.append(total_positions / 1e6)
             total_prog.advance(total_task)
 
             ckpt = dict(epoch=epoch, model=model.state_dict(),
-                        train_loss=avg_train, val_loss=last_val)
+                        train_loss=avg_train, val_loss=last_val,
+                        total_positions=total_positions)
             torch.save(ckpt, CHECKPOINT_DIR / f'epoch_{epoch:02d}.pt')
             if is_best:
                 torch.save(ckpt, CHECKPOINT_DIR / 'best.pt')
+            _save_resume(
+                CHECKPOINT_DIR / 'resume.pt',
+                model=model, optimizer=optimizer, scheduler=scheduler,
+                epoch=epoch, vepoch=vepoch,
+                total_positions=total_positions,
+                positions_at_last_vckpt=positions_at_last_vckpt,
+                best_val=best_val, last_val=last_val, avg_train=avg_train,
+                ckpt_train=ckpt_train, ckpt_val=ckpt_val,
+                ckpt_lrs=ckpt_lrs, ckpt_pos=ckpt_pos,
+            )
 
+            x_vals  = ckpt_pos if args.virtual_epoch_size > 0 else None
+            x_label = 'Positions (M)' if args.virtual_epoch_size > 0 else 'Epoch'
             refresh(approx_steps)
-            save_plots(step_losses, epoch_train, epoch_val, lrs, plot_dir, f'epoch_{epoch:02d}')
-            _print_epoch_summary(console, epoch, args.epochs, avg_train, last_val, lr_now, elapsed, is_best)
+            save_plots(step_losses, ckpt_train, ckpt_val, ckpt_lrs,
+                       plot_dir, f'epoch_{epoch:02d}',
+                       x_values=x_vals, x_label=x_label)
+            _print_checkpoint_summary(
+                console, f'Epoch {epoch}/{args.epochs}',
+                avg_train, last_val, lr_now, elapsed, is_best,
+            )
 
     torch.save(model.state_dict(), CHECKPOINT_DIR / 'nnue_final.pt')
     console.print(f'\n[bold green]Done.[/]  Checkpoints in [dim]{CHECKPOINT_DIR}/[/]')
@@ -392,15 +508,20 @@ if __name__ == '__main__':
     p.add_argument('--epochs',        type=int,   default=5)
     p.add_argument('--batch',         type=int,   default=4096)
     p.add_argument('--lr',            type=float, default=1e-3)
-    p.add_argument('--lr_flat_frac',  type=float, default=0.0,
+    p.add_argument('--lr_flat_frac',  type=float, default=0.25,
                    help='Fraction of epochs to hold LR flat before cosine decay (0=decay immediately)')
     p.add_argument('--loss_alpha',    type=float, default=0.01,
                    help='MSE weight in mixed loss — 0=pure BCE, 1=pure MSE')
     p.add_argument('--workers',       type=int,   default=min(8, os.cpu_count() or 4))
     p.add_argument('--display_steps', type=int,   default=10,
                    help='Refresh live display every N steps')
-    p.add_argument('--plot_steps',    type=int,   default=500,
-                   help='Save plots every N steps')
-    p.add_argument('--val_steps',     type=int,   default=0,
+    p.add_argument('--plot_steps',    type=int,   default=0,
+                   help='Save plots every N steps (0 = only at checkpoints)')
+    p.add_argument('--val_steps',          type=int,   default=0,
                    help='Validate every N steps mid-epoch (0 = epoch end only)')
+    p.add_argument('--resume',             default=None,
+                   help='Resume from resume.pt (or any full checkpoint)')
+    p.add_argument('--virtual_epoch_size', type=int,   default=0,
+                   help='Checkpoint every N positions (0 = epoch end only). '
+                        'E.g. 50_000_000 for 50M-position virtual epochs.')
     train(p.parse_args())
