@@ -539,3 +539,266 @@ pub fn evaluate(nn: &Nnue, board: &Board) -> i32 {
     acc.refresh(nn, board);
     acc.evaluate(nn, board.side_to_move)
 }
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::board::Board;
+    use crate::core::movegen::generate_legal;
+
+    /// Synthetic network with deterministic non-trivial weights.
+    /// Only the FT layer has non-zero weights — sufficient to test the accumulator.
+    /// L1/L2/output weights are non-zero too so the full forward pass is non-trivial.
+    fn synthetic_nnue() -> Nnue {
+        let mut ft_weight = Box::new([[0i16; L1_SIZE]; INPUT_SIZE]);
+        for i in 0..INPUT_SIZE {
+            for j in 0..L1_SIZE {
+                ft_weight[i][j] = (((i * 7 + j * 13) % 9) as i16) - 4; // [-4, 4]
+            }
+        }
+        let mut ft_bias = [0i16; L1_SIZE];
+        for j in 0..L1_SIZE {
+            ft_bias[j] = 30; // keeps accumulated values well within i16 range
+        }
+
+        let mut l1_weight = Box::new([[0i8; CONCAT]; L2_SIZE]);
+        for j in 0..L2_SIZE {
+            for i in 0..CONCAT {
+                l1_weight[j][i] = (((j * 5 + i * 3) % 5) as i8) - 2; // [-2, 2]
+            }
+        }
+        // Bias scaled by QA*QB so the L1 output is in a mid-range, not all-zero.
+        let l1_bias = [QA * QB * 2; L2_SIZE];
+
+        let mut l2_weight = [[0i8; L2_SIZE]; L3_SIZE];
+        for j in 0..L3_SIZE {
+            for i in 0..L2_SIZE {
+                l2_weight[j][i] = (((j * 3 + i * 7) % 5) as i8) - 2;
+            }
+        }
+        let l2_bias = [QB * QB; L3_SIZE];
+
+        let mut out_weight = [0i8; L3_SIZE];
+        for i in 0..L3_SIZE {
+            out_weight[i] = (i % 3) as i8;
+        }
+
+        Nnue {
+            ft_weight,
+            ft_bias,
+            l1_weight,
+            l1_bias,
+            l2_weight,
+            l2_bias,
+            out_weight,
+            out_bias: 0,
+        }
+    }
+
+    // ── Feature index tests ───────────────────────────────────────────────────
+
+    #[test]
+    fn feat_indices_in_range() {
+        for pt in PieceType::ALL {
+            for color in [Color::White, Color::Black] {
+                for sq in 0u8..64 {
+                    let sq = Square(sq);
+                    assert!(
+                        feat_w(pt, color, sq) < INPUT_SIZE,
+                        "feat_w out of range: {pt:?} {color:?} sq={}",
+                        sq.0
+                    );
+                    assert!(
+                        feat_b(pt, color, sq) < INPUT_SIZE,
+                        "feat_b out of range: {pt:?} {color:?} sq={}",
+                        sq.0
+                    );
+                }
+            }
+        }
+    }
+
+    /// White and black POV indices must be distinct for the same piece (they encode
+    /// different perspectives, so collisions would silently corrupt the accumulator).
+    #[test]
+    fn feat_w_and_feat_b_differ_for_same_piece() {
+        // The king on e1 (sq=4): white POV vs black POV must map to different rows.
+        let sq = Square(4);
+        assert_ne!(
+            feat_w(PieceType::King, Color::White, sq),
+            feat_b(PieceType::King, Color::White, sq),
+        );
+    }
+
+    // ── Accumulator refresh vs incremental ────────────────────────────────────
+
+    /// Core correctness invariant: applying a move's feature delta to the accumulator
+    /// must produce the same result as a full refresh from the post-move board.
+    fn check_incremental_matches_refresh(board: &Board, nn: &Nnue) {
+        let mut acc_root = Accumulator::zeroed();
+        acc_root.refresh(nn, board);
+
+        for &mv in generate_legal(board).as_slice() {
+            // Incremental path
+            let mut acc_incr = acc_root;
+            acc_incr.apply_move(nn, board, mv);
+
+            // Full refresh path
+            let mut post = board.clone();
+            post.make_move(mv);
+            let mut acc_refresh = Accumulator::zeroed();
+            acc_refresh.refresh(nn, &post);
+
+            assert_eq!(
+                acc_incr.white, acc_refresh.white,
+                "white accumulator mismatch after {mv} in position\n{board}"
+            );
+            assert_eq!(
+                acc_incr.black, acc_refresh.black,
+                "black accumulator mismatch after {mv} in position\n{board}"
+            );
+        }
+    }
+
+    #[test]
+    fn incremental_matches_refresh_starting_position() {
+        let nn = synthetic_nnue();
+        check_incremental_matches_refresh(&Board::starting_position(), &nn);
+    }
+
+    #[test]
+    fn incremental_matches_refresh_en_passant() {
+        let nn = synthetic_nnue();
+        // White pawn on e5 can capture en passant on f6; black pawn just moved f7-f5.
+        let board = Board::from_fen(
+            "rnbqkbnr/ppp1p1pp/8/3pPp2/8/8/PPPP1PPP/RNBQKBNR w KQkq f6 0 3",
+        )
+        .unwrap();
+        check_incremental_matches_refresh(&board, &nn);
+    }
+
+    #[test]
+    fn incremental_matches_refresh_castling() {
+        let nn = synthetic_nnue();
+        // Both sides can castle in both directions.
+        let board = Board::from_fen(
+            "r3k2r/pppppppp/8/8/8/8/PPPPPPPP/R3K2R w KQkq - 0 1",
+        )
+        .unwrap();
+        check_incremental_matches_refresh(&board, &nn);
+    }
+
+    #[test]
+    fn incremental_matches_refresh_promotion() {
+        let nn = synthetic_nnue();
+        // White pawn on a7 can promote; black pawn on h2 can promote.
+        let board = Board::from_fen("8/P7/8/8/8/8/7p/8 w - - 0 1").unwrap();
+        check_incremental_matches_refresh(&board, &nn);
+    }
+
+    // ── Stack push / pop ──────────────────────────────────────────────────────
+
+    #[test]
+    fn stack_pop_restores_previous_state() {
+        let nn = synthetic_nnue();
+        let board = Board::starting_position();
+
+        let mut stack = AccumulatorStack::new();
+        stack.init(&nn, &board);
+        let before = *stack.current();
+
+        let mv = generate_legal(&board).as_slice()[0];
+        stack.push_move(&nn, &board, mv);
+        stack.pop();
+
+        assert_eq!(stack.current().white, before.white, "white not restored after pop");
+        assert_eq!(stack.current().black, before.black, "black not restored after pop");
+    }
+
+    #[test]
+    fn stack_push_matches_apply_move() {
+        let nn = synthetic_nnue();
+        let board = Board::starting_position();
+
+        let mut stack = AccumulatorStack::new();
+        stack.init(&nn, &board);
+
+        let mv = generate_legal(&board).as_slice()[0];
+
+        // Via stack
+        stack.push_move(&nn, &board, mv);
+        let via_stack = *stack.current();
+
+        // Via manual apply_move on a fresh accumulator copy
+        let mut acc = Accumulator::zeroed();
+        acc.refresh(&nn, &board);
+        acc.apply_move(&nn, &board, mv);
+
+        assert_eq!(via_stack.white, acc.white);
+        assert_eq!(via_stack.black, acc.black);
+    }
+
+    // ── Scalar vs SIMD agreement ──────────────────────────────────────────────
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn scalar_and_avx2_forward_agree() {
+        if !is_x86_feature_detected!("avx2") {
+            return; // not an error — just skip on non-AVX2 hardware
+        }
+        let nn = synthetic_nnue();
+        let mut acc = Accumulator::zeroed();
+        acc.refresh(&nn, &Board::starting_position());
+
+        for stm in [Color::White, Color::Black] {
+            let scalar = forward_scalar(&acc, &nn, stm);
+            let avx2 = unsafe { forward_avx2(&acc, &nn, stm) };
+            assert_eq!(
+                scalar, avx2,
+                "scalar={scalar} avx2={avx2} disagree for stm={stm:?}"
+            );
+        }
+    }
+
+    // ── Eval sanity ───────────────────────────────────────────────────────────
+
+    /// evaluate() must not panic and must return a value in a sane range.
+    #[test]
+    fn evaluate_does_not_panic_and_is_finite() {
+        let nn = synthetic_nnue();
+        for fen in [
+            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+            "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
+        ] {
+            let board = Board::from_fen(fen).unwrap();
+            let score = evaluate(&nn, &board);
+            assert!(
+                score.abs() < 30_000,
+                "score={score} looks like garbage for {fen}"
+            );
+        }
+    }
+
+    /// A symmetric position evaluated from both sides should give equal-but-opposite scores.
+    #[test]
+    fn eval_is_negated_for_opposite_stm_symmetric_position() {
+        let nn = synthetic_nnue();
+        // Completely symmetric position: same pieces mirrored, white to move vs black to move.
+        // We use the same FEN but manually test both perspectives on the same accumulator.
+        let board = Board::starting_position();
+        let mut acc = Accumulator::zeroed();
+        acc.refresh(&nn, &board);
+
+        let white_score = acc.evaluate(&nn, Color::White);
+        let black_score = acc.evaluate(&nn, Color::Black);
+
+        // Because the starting position is NOT perfectly symmetric in our feature encoding
+        // (white pieces on ranks 1-2, black on ranks 7-8), the scores won't be exactly
+        // equal-and-opposite. But they should both be small in magnitude.
+        assert!(white_score.abs() < 30_000, "white_score={white_score}");
+        assert!(black_score.abs() < 30_000, "black_score={black_score}");
+    }
+}

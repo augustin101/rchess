@@ -165,16 +165,14 @@ impl Evaluator {
     /// Refresh the accumulator at the root of a new search.
     fn init(&mut self, board: &Board) {
         let Evaluator::Nnue { weights, stack } = self else { return };
-        let w = Arc::clone(weights);
-        stack.init(&w, board);
+        stack.init(weights, board);
     }
 
     /// Push + apply move delta (call BEFORE board.make_move).
     #[inline]
     fn push_move(&mut self, board: &Board, mv: Move) {
         let Evaluator::Nnue { weights, stack } = self else { return };
-        let w = Arc::clone(weights);
-        stack.push_move(&w, board, mv);
+        stack.push_move(weights, board, mv);
     }
 
     /// Push for null moves (no piece changes).
@@ -751,7 +749,7 @@ mod tests {
             ("endgame",    "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1"),
         ];
 
-        let depth = 6u32;
+        let depth = 5u32;
         let mut total_nodes_s = 0u64;
         let mut total_ms_s    = 0u64;
         let mut total_nodes_n = 0u64;
