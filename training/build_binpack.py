@@ -13,7 +13,7 @@ Feature index (both perspectives must match src/engine/nnue.rs):
   Black POV : feat = piece_type*128 + (1-color)*64 + (square^56)
 
 Usage:
-  # Full run (all 17 files, ~55 min with 22 CPUs)
+  # Full run
   python training/build_binpack.py
 
   # Quick smoke-test (1000 rows per file, <30 s)
@@ -44,8 +44,20 @@ RECORD_SIZE = RECORD_DTYPE.itemsize   # 196 bytes
 
 # ── Filters ───────────────────────────────────────────────────────────────────
 
-MIN_DEPTH = 16       # depth < 16 are low-quality evals
-MAX_ABS_CP = 3000    # clamp extreme evaluations
+MIN_DEPTH  = 16    # depth < 16 are low-quality evals
+MAX_ABS_CP = 800   # skip extreme evaluations
+
+
+def _passes_filters(cp_val, depth: int) -> bool:
+    """Return True if the position should be kept in the dataset."""
+    if cp_val is None:
+        return False          # mate score — no centipawn value
+    if abs(int(cp_val)) > MAX_ABS_CP:
+        return False          # extreme eval — noisy / likely blunder
+    if depth < MIN_DEPTH:
+        return False          # shallow search — unreliable eval
+    return True
+
 
 # ── Feature index constants ───────────────────────────────────────────────────
 
@@ -56,9 +68,10 @@ _PIECE_IDX = {
 
 
 def _extract_features_batch(
-    fens: list[str],
-    cps:  list[int],
+    fens:   list[str],
+    cps:    list[int],
     depths: list[int],
+    moves:  list[str],
 ) -> np.ndarray:
     """
     Convert a batch of FENs to records.
@@ -71,14 +84,9 @@ def _extract_features_batch(
     valid = np.zeros(N, dtype=bool)
 
     for i in range(N):
-        cp_val = cps[i]
-        if cp_val is None:              # mate score — skip
+        if not _passes_filters(cps[i], int(depths[i])):
             continue
-        cp_val = int(cp_val)
-        if abs(cp_val) > MAX_ABS_CP:    # extreme eval — skip
-            continue
-        if int(depths[i]) < MIN_DEPTH:  # shallow — skip
-            continue
+        cp_val = int(cps[i])
 
         fen = fens[i]
         if fen.count(' ') < 5:
@@ -88,6 +96,16 @@ def _extract_features_batch(
             board = chess.Board(fen)
         except Exception:
             continue
+
+        # Skip positions where the main line starts with a capture.
+        # board.is_capture() is a free O(1) mailbox lookup — no extra cost
+        # since the board is already constructed. Handles en passant correctly.
+        if moves[i]:
+            try:
+                if board.is_capture(chess.Move.from_uci(moves[i])):
+                    continue
+            except ValueError:
+                pass  # malformed UCI move — keep the position
 
         tmp[i]['cp']  = np.int16(cp_val)
         tmp[i]['stm'] = np.uint8(0 if board.turn == chess.WHITE else 1)
@@ -129,6 +147,9 @@ def _process_file(args: tuple) -> tuple[int, int]:
         print(f"[worker {worker_id}] ERROR opening {filepath}: {exc}")
         return 0, 0
 
+    has_move = 'move' in set(pf.schema_arrow.names)
+    columns  = ['fen', 'cp', 'depth'] + (['move'] if has_move else [])
+
     out_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = out_path.with_suffix('.tmp')
 
@@ -138,13 +159,11 @@ def _process_file(args: tuple) -> tuple[int, int]:
     BATCH = 50_000
 
     with open(tmp_path, 'wb') as fout:
-        for batch in pf.iter_batches(
-            batch_size=BATCH,
-            columns=['fen', 'cp', 'depth'],
-        ):
+        for batch in pf.iter_batches(batch_size=BATCH, columns=columns):
             fens   = batch.column('fen').to_pylist()
             cps    = batch.column('cp').to_pylist()
             depths = batch.column('depth').to_pylist()
+            moves  = batch.column('move').to_pylist() if has_move else [''] * len(fens)
 
             if max_rows is not None:
                 remaining = max_rows - rows_seen
@@ -154,11 +173,12 @@ def _process_file(args: tuple) -> tuple[int, int]:
                     fens   = fens[:remaining]
                     cps    = cps[:remaining]
                     depths = depths[:remaining]
+                    moves  = moves[:remaining]
 
             rows_seen += len(fens)
             n_skipped += len(fens)   # will subtract valid below
 
-            records = _extract_features_batch(fens, cps, depths)
+            records = _extract_features_batch(fens, cps, depths, moves)
             if len(records):
                 rng.shuffle(records)  # chunk-level shuffle
                 fout.write(records.tobytes())
