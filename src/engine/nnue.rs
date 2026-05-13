@@ -369,7 +369,8 @@ fn forward_scalar(acc: &Accumulator, nn: &Nnue, stm: Color) -> i32 {
     for i in 0..L3_SIZE {
         out += l2[i] * (nn.out_weight[i] as i32);
     }
-    // out ≈ QB² × tanh(cp / EVAL_SCALE)  →  cp ≈ out × EVAL_SCALE / QB²
+    // Model is trained with BCE: logit ≈ cp / EVAL_SCALE, quantised as QB² × logit.
+    // Invert: cp = logit × EVAL_SCALE = out × EVAL_SCALE / QB²
     out * EVAL_SCALE / (QB * QB)
 }
 
@@ -528,6 +529,7 @@ fn out_forward_scalar(l2: &[i32; L3_SIZE], nn: &Nnue) -> i32 {
     for i in 0..L3_SIZE {
         out += l2[i] * (nn.out_weight[i] as i32);
     }
+    // out = QB² × logit;  cp = logit × EVAL_SCALE = out × EVAL_SCALE / QB²
     out * EVAL_SCALE / (QB * QB)
 }
 

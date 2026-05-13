@@ -118,7 +118,7 @@ def _sanity_check(model, ft_w_q, ft_b_q, l1_w_q, l1_b_q, l2_w_q, l2_b_q,
 
     # Use the starting position (White to move, cp ≈ 0)
     fen = chess.Board().fen().rsplit(' ', 2)[0]   # drop move clocks
-    records = _extract_features_batch([fen], [0], [99])
+    records, _ = _extract_features_batch([fen], [0], [99])
     if len(records) == 0:
         print("Sanity check: skipped (FEN extraction failed)")
         return

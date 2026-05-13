@@ -9,6 +9,7 @@ Usage:
 """
 
 import argparse
+import math
 import os
 import time
 from collections import deque
@@ -165,6 +166,29 @@ def save_plots(
     plt.close()
 
 
+# ── Loss function ─────────────────────────────────────────────────────────────
+
+class MixedLoss(nn.Module):
+    """
+    (1 - α) · BCE(logit, sigmoid(cp/SCALE)) + α · MSE(logit, cp/SCALE)
+
+    BCE handles "who is winning" (strategy).
+    MSE on raw logits handles "by how much" (precision).
+    Start with a small α (e.g. 0.01).
+    """
+    def __init__(self, alpha: float = 0.01):
+        super().__init__()
+        self.alpha = alpha
+        self._bce  = nn.BCEWithLogitsLoss()
+        self._mse  = nn.MSELoss()
+
+    def forward(self, logits: torch.Tensor, cp: torch.Tensor) -> torch.Tensor:
+        cp_norm = (cp / SCALE_CP).unsqueeze(1)
+        bce = self._bce(logits, torch.sigmoid(cp_norm))
+        mse = self._mse(logits, cp_norm)
+        return (1.0 - self.alpha) * bce + self.alpha * mse
+
+
 # ── Training helpers ──────────────────────────────────────────────────────────
 
 def _train_step(
@@ -179,10 +203,9 @@ def _train_step(
     wbits, bbits, stm, cp = batch
     t0 = time.perf_counter()
     wf, bf, stm, cp = unpack_batch(wbits, bbits, stm, cp, device)
-    target = torch.sigmoid(cp / SCALE_CP).unsqueeze(1)
     optimizer.zero_grad()
     pred = model(wf, bf, stm)
-    loss = loss_fn(pred, target)
+    loss = loss_fn(pred, cp)
     loss.backward()
     optimizer.step()
     return loss.item(), batch_size / (time.perf_counter() - t0)
@@ -236,8 +259,17 @@ def train(args: argparse.Namespace) -> None:
 
     model     = NNUE().to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
-    loss_fn   = nn.BCEWithLogitsLoss()
+    loss_fn   = MixedLoss(alpha=args.loss_alpha)
+
+    # Hold LR flat for lr_flat_frac of training, then cosine-decay to 0.
+    flat_epochs  = int(args.lr_flat_frac * args.epochs)
+    decay_epochs = max(1, args.epochs - flat_epochs)
+    def _lr_lambda(epoch: int) -> float:
+        if epoch < flat_epochs:
+            return 1.0
+        t = (epoch - flat_epochs) / decay_epochs
+        return 0.5 * (1.0 + math.cos(math.pi * t))
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, _lr_lambda)
 
     recent_losses: deque[float] = deque(maxlen=300)
     pps_history:   deque[float] = deque(maxlen=30)
@@ -360,6 +392,10 @@ if __name__ == '__main__':
     p.add_argument('--epochs',        type=int,   default=5)
     p.add_argument('--batch',         type=int,   default=4096)
     p.add_argument('--lr',            type=float, default=1e-3)
+    p.add_argument('--lr_flat_frac',  type=float, default=0.0,
+                   help='Fraction of epochs to hold LR flat before cosine decay (0=decay immediately)')
+    p.add_argument('--loss_alpha',    type=float, default=0.01,
+                   help='MSE weight in mixed loss — 0=pure BCE, 1=pure MSE')
     p.add_argument('--workers',       type=int,   default=min(8, os.cpu_count() or 4))
     p.add_argument('--display_steps', type=int,   default=10,
                    help='Refresh live display every N steps')

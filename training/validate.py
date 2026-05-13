@@ -136,10 +136,10 @@ def save_validation_plots(results: dict, out_path: Path) -> None:
 
     # 1. Predicted cp vs true cp (2D density)
     ax = axes[0]
-    lim = 2000
+    lim = 900
     mask = (np.abs(cp_vals) < lim) & (np.abs(cp_pred) < lim)
     ax.hexbin(cp_vals[mask], cp_pred[mask], gridsize=80,
-              cmap='Blues', mincnt=1, linewidths=0.1)
+              cmap='plasma', mincnt=1, linewidths=0.1)
     ax.plot([-lim, lim], [-lim, lim], 'r--', linewidth=1, label='perfect')
     ax.set_xlabel('True centipawns')
     ax.set_ylabel('Predicted centipawns')
