@@ -85,6 +85,10 @@ def build_display(
     m.add_row('Val loss',
               f'[green]{last_val:.5f}[/]  best [bold green]{best_val:.5f}[/]'
               if not np.isnan(last_val) else '[dim]—[/]')
+    if not np.isnan(last_val):
+        gap = last_val - smooth_loss
+        m.add_row('Train/Val gap',
+                  f'[red]{gap:+.5f}[/]' if gap > 0.005 else f'[green]{gap:+.5f}[/]')
     m.add_row('',                '')
     m.add_row('Positions / sec', f'[cyan]{avg_pps:,.0f}[/]')
     m.add_row('ms / batch',      f'{1000.0 / avg_pps:.2f}' if avg_pps > 0 else '—')
@@ -161,6 +165,61 @@ def save_plots(
     plt.close()
 
 
+# ── Training helpers ──────────────────────────────────────────────────────────
+
+def _train_step(
+    model:      nn.Module,
+    optimizer:  torch.optim.Optimizer,
+    loss_fn:    nn.Module,
+    batch:      tuple,
+    device:     torch.device,
+    batch_size: int,
+) -> tuple[float, float]:
+    """One forward+backward pass. Returns (loss_value, positions_per_sec)."""
+    wbits, bbits, stm, cp = batch
+    t0 = time.perf_counter()
+    wf, bf, stm, cp = unpack_batch(wbits, bbits, stm, cp, device)
+    target = torch.sigmoid(cp / SCALE_CP).unsqueeze(1)
+    optimizer.zero_grad()
+    pred = model(wf, bf, stm)
+    loss = loss_fn(pred, target)
+    loss.backward()
+    optimizer.step()
+    return loss.item(), batch_size / (time.perf_counter() - t0)
+
+
+def _run_validation(model: nn.Module, loader, device: torch.device) -> float:
+    """Evaluate on loader, restore train mode, return BCE loss."""
+    val_loss = run_validation(model, loader, device)['bce_loss']
+    model.train()
+    return val_loss
+
+
+def _print_epoch_summary(
+    console:      Console,
+    epoch:        int,
+    total_epochs: int,
+    avg_train:    float,
+    last_val:     float,
+    lr_now:       float,
+    elapsed:      float,
+    is_best:      bool,
+) -> None:
+    best_marker  = '  [bold green]★ best[/]' if is_best else ''
+    gap          = last_val - avg_train
+    gap_color    = 'red' if gap > 0.005 else 'green'
+    overfit_warn = '  [bold red]⚠ overfit[/]' if gap > 0.01 else ''
+    console.print(
+        f'[bold]Epoch {epoch}/{total_epochs}[/]  '
+        f'train=[yellow]{avg_train:.5f}[/]  '
+        f'val=[green]{last_val:.5f}[/]  '
+        f'Δ=[{gap_color}]{gap:+.5f}[/]  '
+        f'lr={lr_now:.2e}  '
+        f'[dim]{elapsed:.0f}s[/]'
+        f'{best_marker}{overfit_warn}'
+    )
+
+
 # ── Training ──────────────────────────────────────────────────────────────────
 
 def train(args: argparse.Namespace) -> None:
@@ -173,7 +232,6 @@ def train(args: argparse.Namespace) -> None:
         batch_size  = args.batch,
         num_workers = args.workers,
     )
-
     approx_steps = max(1, len(train_loader.dataset) // args.batch)
 
     model     = NNUE().to(device)
@@ -181,23 +239,16 @@ def train(args: argparse.Namespace) -> None:
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
     loss_fn   = nn.BCEWithLogitsLoss()
 
-    n_params = sum(p.numel() for p in model.parameters())
-
-    # Rolling buffers for live display
-    recent_losses = deque(maxlen=300)
-    pps_history   = deque(maxlen=30)
-
-    # Full history for plots
+    recent_losses: deque[float] = deque(maxlen=300)
+    pps_history:   deque[float] = deque(maxlen=30)
     step_losses: list[float] = []
     epoch_train: list[float] = []
     epoch_val:   list[float] = []
     lrs:         list[float] = []
-
     last_val = float('nan')
     best_val = float('inf')
     lr_now   = args.lr
 
-    # ── Rich progress bars ────────────────────────────────────────────────────
     epoch_prog = Progress(
         SpinnerColumn(),
         TextColumn('[progress.description]{task.description}'),
@@ -219,7 +270,7 @@ def train(args: argparse.Namespace) -> None:
     console = Console()
     console.print(
         f'[bold]rchess NNUE[/]  device=[cyan]{device}[/]  '
-        f'params=[cyan]{n_params:,}[/]  '
+        f'params=[cyan]{sum(p.numel() for p in model.parameters()):,}[/]  '
         f'batch=[cyan]{args.batch:,}[/]  '
         f'lr=[cyan]{args.lr}[/]  '
         f'epochs=[cyan]{args.epochs}[/]'
@@ -232,49 +283,43 @@ def train(args: argparse.Namespace) -> None:
             epoch_loss  = 0.0
             n_batches   = 0
             epoch_start = time.perf_counter()
-
-            # Reset epoch progress bar
             epoch_prog.reset(epoch_task, total=approx_steps,
                              description=f'Epoch {epoch}/{args.epochs}')
 
-            for step, (wbits, bbits, stm, cp) in enumerate(train_loader, 1):
-                iter_start = time.perf_counter()
+            def refresh(step: int) -> None:
+                live.update(build_display(
+                    epoch=epoch, total_epochs=args.epochs,
+                    step=step, approx_steps=approx_steps,
+                    recent_losses=recent_losses, pps_history=pps_history,
+                    last_val=last_val, best_val=best_val, lr=lr_now,
+                    epoch_elapsed=time.perf_counter() - epoch_start,
+                    epoch_progress=epoch_prog, total_progress=total_prog,
+                ))
 
-                wf, bf, stm, cp = unpack_batch(wbits, bbits, stm, cp, device)
-                target = torch.sigmoid(cp / SCALE_CP).unsqueeze(1)
-
-                optimizer.zero_grad()
-                pred = model(wf, bf, stm)
-                loss = loss_fn(pred, target)
-                loss.backward()
-                optimizer.step()
-
-                iter_time = time.perf_counter() - iter_start
-                loss_val  = loss.item()
-
+            for step, batch in enumerate(train_loader, 1):
+                loss_val, pps = _train_step(model, optimizer, loss_fn, batch, device, args.batch)
                 recent_losses.append(loss_val)
-                pps_history.append(args.batch / iter_time)
+                pps_history.append(pps)
                 step_losses.append(loss_val)
                 epoch_loss += loss_val
                 n_batches  += 1
-
                 epoch_prog.advance(epoch_task)
 
-                # Refresh live display every N steps
-                if step % args.display_steps == 0:
-                    live.update(build_display(
-                        epoch=epoch, total_epochs=args.epochs,
-                        step=step, approx_steps=approx_steps,
-                        recent_losses=recent_losses, pps_history=pps_history,
-                        last_val=last_val, best_val=best_val, lr=lr_now,
-                        epoch_elapsed=time.perf_counter() - epoch_start,
-                        epoch_progress=epoch_prog, total_progress=total_prog,
-                    ))
+                if args.val_steps > 0 and step % args.val_steps == 0:
+                    last_val = _run_validation(model, val_loader, device)
+                    if last_val < best_val:
+                        best_val = last_val
+                        torch.save(dict(epoch=epoch, model=model.state_dict(),
+                                        train_loss=float(np.mean(recent_losses)),
+                                        val_loss=last_val),
+                                   CHECKPOINT_DIR / 'best.pt')
+                    refresh(step)
 
-                # Save plots periodically
+                if step % args.display_steps == 0:
+                    refresh(step)
+
                 if step % args.plot_steps == 0:
-                    save_plots(step_losses, epoch_train, epoch_val, lrs,
-                               plot_dir, f'step_{step}')
+                    save_plots(step_losses, epoch_train, epoch_val, lrs, plot_dir, f'step_{step}')
 
             # ── End of epoch ─────────────────────────────────────────────────
             scheduler.step()
@@ -282,28 +327,15 @@ def train(args: argparse.Namespace) -> None:
             lr_now    = float(scheduler.get_last_lr()[0])
             elapsed   = time.perf_counter() - epoch_start
 
-            # Validation
-            val_metrics = run_validation(model, val_loader, device)
-            last_val    = val_metrics['bce_loss']
-            is_best     = last_val < best_val
+            last_val = _run_validation(model, val_loader, device)
+            is_best  = last_val < best_val
             if is_best:
                 best_val = last_val
 
             epoch_train.append(avg_train)
             epoch_val.append(last_val)
             lrs.append(lr_now)
-
             total_prog.advance(total_task)
-
-            # Final display update for this epoch
-            live.update(build_display(
-                epoch=epoch, total_epochs=args.epochs,
-                step=approx_steps, approx_steps=approx_steps,
-                recent_losses=recent_losses, pps_history=pps_history,
-                last_val=last_val, best_val=best_val, lr=lr_now,
-                epoch_elapsed=elapsed,
-                epoch_progress=epoch_prog, total_progress=total_prog,
-            ))
 
             ckpt = dict(epoch=epoch, model=model.state_dict(),
                         train_loss=avg_train, val_loss=last_val)
@@ -311,18 +343,9 @@ def train(args: argparse.Namespace) -> None:
             if is_best:
                 torch.save(ckpt, CHECKPOINT_DIR / 'best.pt')
 
-            save_plots(step_losses, epoch_train, epoch_val, lrs,
-                       plot_dir, f'epoch_{epoch:02d}')
-
-            best_marker = '  [bold green]★ best[/]' if is_best else ''
-            console.print(
-                f'[bold]Epoch {epoch}/{args.epochs}[/]  '
-                f'train=[yellow]{avg_train:.5f}[/]  '
-                f'val=[green]{last_val:.5f}[/]  '
-                f'lr={lr_now:.2e}  '
-                f'[dim]{elapsed:.0f}s[/]'
-                f'{best_marker}'
-            )
+            refresh(approx_steps)
+            save_plots(step_losses, epoch_train, epoch_val, lrs, plot_dir, f'epoch_{epoch:02d}')
+            _print_epoch_summary(console, epoch, args.epochs, avg_train, last_val, lr_now, elapsed, is_best)
 
     torch.save(model.state_dict(), CHECKPOINT_DIR / 'nnue_final.pt')
     console.print(f'\n[bold green]Done.[/]  Checkpoints in [dim]{CHECKPOINT_DIR}/[/]')
@@ -342,4 +365,6 @@ if __name__ == '__main__':
                    help='Refresh live display every N steps')
     p.add_argument('--plot_steps',    type=int,   default=500,
                    help='Save plots every N steps')
+    p.add_argument('--val_steps',     type=int,   default=0,
+                   help='Validate every N steps mid-epoch (0 = epoch end only)')
     train(p.parse_args())
