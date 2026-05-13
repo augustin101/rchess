@@ -36,8 +36,7 @@ from model import NNUE, SCALE_CP
 from dataset import make_loaders, unpack_batch
 from validate import run_validation
 
-CHECKPOINT_DIR = Path('checkpoints')
-SPARK_CHARS    = ' ▁▂▃▄▅▆▇█'
+SPARK_CHARS = ' ▁▂▃▄▅▆▇█'
 
 
 # ── Terminal sparkline ────────────────────────────────────────────────────────
@@ -275,6 +274,7 @@ def _save_resume(path: Path, *, model, optimizer, scheduler, epoch, vepoch,
 # ── Training ──────────────────────────────────────────────────────────────────
 
 def train(args: argparse.Namespace) -> None:
+    CHECKPOINT_DIR = Path(args.checkpoint_dir)
     CHECKPOINT_DIR.mkdir(exist_ok=True)
     plot_dir = CHECKPOINT_DIR / 'plots'
     device   = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -503,13 +503,24 @@ def train(args: argparse.Namespace) -> None:
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 if __name__ == '__main__':
-    p = argparse.ArgumentParser()
+    # Pre-parse just --config so we can load it before argparse sets defaults.
+    _pre = argparse.ArgumentParser(add_help=False)
+    _pre.add_argument('--config', default=None)
+    _pre_args, _ = _pre.parse_known_args()
+
+    p = argparse.ArgumentParser(
+        description='rchess NNUE training',
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    p.add_argument('--config',        default=None,
+                   help='JSON config file. Keys match flag names (without --). '
+                        'CLI flags always override config values.')
     p.add_argument('--splits',        default='data/binpack/splits.json')
     p.add_argument('--epochs',        type=int,   default=5)
     p.add_argument('--batch',         type=int,   default=4096)
     p.add_argument('--lr',            type=float, default=1e-3)
     p.add_argument('--lr_flat_frac',  type=float, default=0.25,
-                   help='Fraction of epochs to hold LR flat before cosine decay (0=decay immediately)')
+                   help='Fraction of epochs to hold LR flat before cosine decay')
     p.add_argument('--loss_alpha',    type=float, default=0.01,
                    help='MSE weight in mixed loss — 0=pure BCE, 1=pure MSE')
     p.add_argument('--workers',       type=int,   default=min(8, os.cpu_count() or 4))
@@ -519,9 +530,27 @@ if __name__ == '__main__':
                    help='Save plots every N steps (0 = only at checkpoints)')
     p.add_argument('--val_steps',          type=int,   default=0,
                    help='Validate every N steps mid-epoch (0 = epoch end only)')
+    p.add_argument('--checkpoint_dir',     default='checkpoints',
+                   help='Directory for checkpoints, plots and config.json')
     p.add_argument('--resume',             default=None,
                    help='Resume from resume.pt (or any full checkpoint)')
     p.add_argument('--virtual_epoch_size', type=int,   default=0,
-                   help='Checkpoint every N positions (0 = epoch end only). '
-                        'E.g. 50_000_000 for 50M-position virtual epochs.')
-    train(p.parse_args())
+                   help='Checkpoint every N positions. E.g. 50_000_000 for 50M-position virtual epochs.')
+
+    # Config file values become new defaults; explicit CLI flags still win.
+    if _pre_args.config:
+        import json as _json
+        _cfg = _json.loads(Path(_pre_args.config).read_text())
+        _cfg.pop('config', None)   # don't let config point at itself
+        p.set_defaults(**_cfg)
+
+    args = p.parse_args()
+
+    # Save the fully-resolved config for reproducibility.
+    import json as _json
+    _ckpt_dir = Path(args.checkpoint_dir)
+    _ckpt_dir.mkdir(exist_ok=True)
+    _resolved = {k: v for k, v in vars(args).items() if k != 'config'}
+    (_ckpt_dir / 'config.json').write_text(_json.dumps(_resolved, indent=2))
+
+    train(args)

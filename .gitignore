@@ -5,4 +5,4 @@ training/logs
 training/__pycache__
 training/outputs
 data/*
-checkpoints/*
+checkpoints*
