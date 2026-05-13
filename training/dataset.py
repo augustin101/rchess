@@ -48,7 +48,7 @@ def unpack_batch(
         white_feat : [B, 768] float32
         black_feat : [B, 768] float32
         stm        : [B]      int64
-        cp         : [B]      float32
+        cp         : [B]      float32  — centipawns from STM's perspective
     """
     global _SHIFTS
     if _SHIFTS is None or _SHIFTS.device != device:
@@ -63,6 +63,7 @@ def unpack_batch(
 
     stm = stm.to(device, non_blocking=True)
     cp  = cp.to(device,  non_blocking=True)
+    cp  = cp * (1.0 - 2.0 * stm.float())   # white POV → stm POV
     return white_feat, black_feat, stm, cp
 
 
