@@ -9,8 +9,6 @@ use crate::engine::alpha_beta::AlphaBetaEngine;
 use crate::engine::nnue::Nnue;
 use crate::engine::time_manager::TimeManager;
 
-/// Path to the NNUE binary, set at compile time from engine.toml.
-const NNUE_PATH: &str = env!("RCHESS_NNUE_PATH");
 
 const MAX_SEARCH_DEPTH: u32 = 20;
 
@@ -146,9 +144,11 @@ pub fn run(use_nnue: bool) {
 
     // Try embedded weights first, then fall back to the runtime path from engine.toml.
     // Pass --no-nnue to force static evaluation regardless of available weights.
+    // Prefer compile-time embedded weights (embed-nnue feature); fall back to
+    // loading the file at runtime so plain `cargo build` still works during dev.
     let nnue: Option<Arc<Nnue>> = if use_nnue {
         Nnue::load_embedded()
-            .or_else(|| Nnue::load(NNUE_PATH).ok())
+            .or_else(Nnue::load_default)
             .map(Arc::new)
     } else {
         None

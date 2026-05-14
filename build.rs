@@ -10,7 +10,7 @@ fn main() {
     // Rebuild whenever the network file itself changes.
     println!("cargo:rerun-if-changed={nnue_path}");
 
-    // Enable the embed_nnue cfg flag when the Cargo feature is active.
+    // Emit the embed_nnue cfg flag when --features embed-nnue is passed.
     if std::env::var("CARGO_FEATURE_EMBED_NNUE").is_ok() {
         println!("cargo:rustc-cfg=embed_nnue");
     }

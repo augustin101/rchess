@@ -555,9 +555,18 @@ def render(
 # ── Build ─────────────────────────────────────────────────────────────────────
 
 def build(root: Path) -> Path:
-    print(f'{CYN}Building rchess-uci --release …{R}')
+    # Read the active network from engine.toml so we can print it clearly.
+    try:
+        cfg = (root / 'engine.toml').read_text()
+        nnue_line = next((l for l in cfg.splitlines() if l.strip().startswith('nnue')), '')
+        nnue_file = nnue_line.split('=', 1)[-1].strip().strip('"\'') if nnue_line else '?'
+    except Exception:
+        nnue_file = '?'
+
+    print(f'{CYN}Building rchess-uci --release --features embed-nnue{R}')
+    print(f'{DIM}  embedding: {nnue_file}{R}')
     r = subprocess.run(
-        ['cargo', 'build', '--release', '--bin', 'rchess-uci'],
+        ['cargo', 'build', '--release', '--bin', 'rchess-uci', '--features', 'embed-nnue'],
         cwd=root,
     )
     if r.returncode != 0:

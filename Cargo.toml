@@ -17,7 +17,8 @@ name = "rchess"
 path = "src/lib.rs"
 
 [features]
-# Embed the configured NNUE binary at compile time (no file needed at runtime).
+# Embed the NNUE binary configured in engine.toml at compile time.
+# The match script uses this so the binary is fully self-contained.
 # Usage: cargo build --features embed-nnue
 embed-nnue = []
 
@@ -28,5 +29,5 @@ serde      = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 [lints.rust]
-# embed_nnue is emitted by build.rs when the embed-nnue feature is active.
+# embed_nnue is a custom cfg emitted by build.rs — tell rustc it is expected.
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(embed_nnue)'] }

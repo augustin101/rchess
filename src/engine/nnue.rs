@@ -142,8 +142,14 @@ impl Nnue {
         Ok(Nnue { ft_weight, ft_bias, l1_weight, l1_bias, l2_weight, l2_bias, out_weight, out_bias })
     }
 
-    /// Load compile-time embedded weights (requires `--features embed-nnue` at build time).
-    /// The embedded file is determined by the `nnue` key in `engine.toml`.
+    /// Load weights from the path configured in `engine.toml` (baked in at compile time).
+    /// Used as a runtime fallback when the binary was not built with `embed-nnue`.
+    pub fn load_default() -> Option<Self> {
+        Self::load(env!("RCHESS_NNUE_PATH")).ok()
+    }
+
+    /// Load compile-time embedded weights (`--features embed-nnue`).
+    /// The embedded file is the one pointed to by `engine.toml` at build time.
     pub fn load_embedded() -> Option<Self> {
         #[cfg(embed_nnue)]
         {
