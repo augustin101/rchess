@@ -1,4 +1,5 @@
 use std::io::{self, BufRead, Write};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::core::board::Board;
@@ -6,6 +7,10 @@ use crate::core::movegen::generate_legal;
 use crate::core::moves::Move;
 use crate::core::types::{Color, PieceType, Square};
 use crate::engine::alpha_beta::AlphaBetaEngine;
+use crate::engine::nnue::Nnue;
+
+/// Path to the NNUE binary, set at compile time from engine.toml.
+const NNUE_PATH: &str = env!("RCHESS_NNUE_PATH");
 
 const MAX_SEARCH_DEPTH: u32 = 20;
 
@@ -128,13 +133,27 @@ fn compute_deadline(go: &GoParams, side: Color, overhead_ms: u64) -> (Instant, u
     (Instant::now() + Duration::from_millis(budget), MAX_SEARCH_DEPTH)
 }
 
+// ── Engine factory ────────────────────────────────────────────────────────────
+
+fn make_engine(nnue: &Option<Arc<Nnue>>) -> AlphaBetaEngine {
+    match nnue {
+        Some(nn) => AlphaBetaEngine::with_nnue(MAX_SEARCH_DEPTH, nn.clone()),
+        None     => AlphaBetaEngine::with_depth(MAX_SEARCH_DEPTH),
+    }
+}
+
 // ── Main UCI loop ─────────────────────────────────────────────────────────────
 
 pub fn run() {
     let stdin  = io::stdin();
     let stdout = io::stdout();
 
-    let mut engine = AlphaBetaEngine::with_depth(MAX_SEARCH_DEPTH);
+    // Try embedded weights first, then fall back to the runtime path from engine.toml.
+    let nnue: Option<Arc<Nnue>> = Nnue::load_embedded()
+        .or_else(|| Nnue::load(NNUE_PATH).ok())
+        .map(Arc::new);
+
+    let mut engine = make_engine(&nnue);
     let mut board  = Board::starting_position();
     let mut move_overhead_ms: u64 = 30;
 
@@ -157,7 +176,7 @@ pub fn run() {
             }
             "isready"    => println!("readyok"),
             "ucinewgame" => {
-                engine = AlphaBetaEngine::with_depth(MAX_SEARCH_DEPTH);
+                engine = make_engine(&nnue);
                 board  = Board::starting_position();
             }
             "quit" => break,

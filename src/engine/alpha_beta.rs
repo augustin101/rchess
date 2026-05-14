@@ -737,9 +737,10 @@ mod tests {
         use std::sync::Arc;
         use super::nnue;
 
-        let nnue = match nnue::Nnue::load("networks/nnue.bin") {
+        let nnue_path = env!("RCHESS_NNUE_PATH");
+        let nnue = match nnue::Nnue::load(nnue_path) {
             Ok(n)  => Arc::new(n),
-            Err(e) => { println!("speed_nnue: skipping — could not load networks/nnue.bin: {e}"); return; }
+            Err(e) => { println!("speed_nnue: skipping — could not load {nnue_path}: {e}"); return; }
         };
 
         let positions = [

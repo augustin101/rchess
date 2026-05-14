@@ -142,13 +142,13 @@ impl Nnue {
         Ok(Nnue { ft_weight, ft_bias, l1_weight, l1_bias, l2_weight, l2_bias, out_weight, out_bias })
     }
 
-    /// Load compile-time embedded weights.
-    /// Enable with `RUSTFLAGS="--cfg embed_nnue" cargo build` (requires `networks/nnue.bin` at build time).
+    /// Load compile-time embedded weights (requires `--features embed-nnue` at build time).
+    /// The embedded file is determined by the `nnue` key in `engine.toml`.
     pub fn load_embedded() -> Option<Self> {
         #[cfg(embed_nnue)]
         {
             static BYTES: &[u8] = include_bytes!(
-                concat!(env!("CARGO_MANIFEST_DIR"), "/networks/nnue.bin")
+                concat!(env!("CARGO_MANIFEST_DIR"), "/", env!("RCHESS_NNUE_PATH"))
             );
             return Self::from_slice(BYTES).ok();
         }

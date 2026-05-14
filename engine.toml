@@ -1,0 +1,9 @@
+# rchess engine configuration
+#
+# nnue: path (relative to project root) to the NNUE binary used by:
+#   - runtime loading in the UCI engine
+#   - compile-time embedding when built with --features embed-nnue
+#   - the speed_nnue benchmark test
+#
+# To switch networks, change the path here and recompile.
+nnue = "networks/nnue.bin"
