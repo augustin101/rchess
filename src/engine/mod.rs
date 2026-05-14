@@ -6,6 +6,7 @@ pub mod eval;
 pub mod nnue;
 pub mod opening_book;
 pub mod random;
+pub mod time_manager;
 mod pst;
 
 pub trait Engine {

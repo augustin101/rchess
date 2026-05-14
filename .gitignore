@@ -4,5 +4,6 @@ training/checkpoints
 training/logs
 training/__pycache__
 training/outputs
-data/*
+data*
 checkpoints*
+results*

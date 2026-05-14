@@ -1,6 +1,5 @@
 use std::io::{self, BufRead, Write};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use crate::core::board::Board;
 use crate::core::movegen::generate_legal;
@@ -8,6 +7,7 @@ use crate::core::moves::Move;
 use crate::core::types::{Color, PieceType, Square};
 use crate::engine::alpha_beta::AlphaBetaEngine;
 use crate::engine::nnue::Nnue;
+use crate::engine::time_manager::TimeManager;
 
 /// Path to the NNUE binary, set at compile time from engine.toml.
 const NNUE_PATH: &str = env!("RCHESS_NNUE_PATH");
@@ -108,29 +108,25 @@ fn parse_go(line: &str) -> GoParams {
     p
 }
 
-fn compute_deadline(go: &GoParams, side: Color, overhead_ms: u64) -> (Instant, u32) {
-    // Returns (deadline, max_depth).
+/// Build a TimeManager and resolve the max search depth from a `go` command.
+fn create_time_manager(go: &GoParams, side: Color, overhead_ms: u64) -> (TimeManager, u32) {
     if go.infinite {
-        return (Instant::now() + Duration::from_secs(3600), MAX_SEARCH_DEPTH);
+        return (TimeManager::infinite(), MAX_SEARCH_DEPTH);
     }
     if let Some(d) = go.depth {
-        return (Instant::now() + Duration::from_secs(3600), d);
+        return (TimeManager::infinite(), d);
     }
     if let Some(ms) = go.movetime {
-        let budget = ms.saturating_sub(overhead_ms).max(1);
-        return (Instant::now() + Duration::from_millis(budget), MAX_SEARCH_DEPTH);
+        let adjusted = ms.saturating_sub(overhead_ms).max(1);
+        return (TimeManager::from_movetime(adjusted), MAX_SEARCH_DEPTH);
     }
-    // Incremental time control.
+    // Incremental time control — pass overhead-adjusted time to the manager.
     let (time_ms, inc_ms) = match side {
         Color::White => (go.wtime.unwrap_or(30_000), go.winc),
         Color::Black => (go.btime.unwrap_or(30_000), go.binc),
     };
-    // Use ~1/30th of remaining time plus half the increment, minus overhead.
-    let budget = ((time_ms / 30) + inc_ms / 2)
-        .saturating_sub(overhead_ms)
-        .max(1)
-        .min(time_ms.saturating_sub(overhead_ms + 10));
-    (Instant::now() + Duration::from_millis(budget), MAX_SEARCH_DEPTH)
+    let safe_ms = time_ms.saturating_sub(overhead_ms).max(1);
+    (TimeManager::new(safe_ms, inc_ms, None), MAX_SEARCH_DEPTH)
 }
 
 // ── Engine factory ────────────────────────────────────────────────────────────
@@ -209,9 +205,9 @@ pub fn run(use_nnue: bool) {
                     Some(legal.as_slice()[0])
                 } else {
                     let go = parse_go(line);
-                    let (deadline, max_depth) = compute_deadline(&go, board.side_to_move, move_overhead_ms);
+                    let (tm, max_depth) = create_time_manager(&go, board.side_to_move, move_overhead_ms);
                     engine.set_depth(max_depth);
-                    engine.choose_move_timed(&board, deadline)
+                    engine.choose_move_timed(&board, tm)
                 };
                 let mv_str = mv.map_or_else(|| "0000".to_string(), |m| m.to_string());
                 println!("bestmove {mv_str}");

@@ -1,4 +1,6 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use crate::core::bitboard::{lsb, EMPTY};
 use crate::core::board::Board;
@@ -8,10 +10,24 @@ use crate::core::types::{Color, PieceType};
 use super::Engine;
 use super::eval::{static_eval, CHECKMATE_SCORE};
 use super::nnue;
+use super::time_manager::TimeManager;
 
 const NEG_INF: i32 = -(CHECKMATE_SCORE + 1);
 const POS_INF: i32 =   CHECKMATE_SCORE + 1;
 const MAX_PLY: usize = 64;
+
+// ── Time management ───────────────────────────────────────────────────────────
+
+/// Check the hard deadline every this many nodes (must be a power of 2).
+const NORMAL_CHECK_INTERVAL: u64 = 2048;
+/// Tighter interval when the clock is nearly empty.
+const PANIC_CHECK_INTERVAL:  u64 = 256;
+
+// ── Aspiration windows ────────────────────────────────────────────────────────
+
+const ASPIRATION_DELTA:     i32 = 50;    // initial window half-width (cp)
+const ASPIRATION_MIN_DEPTH: u32 = 4;    // don't use aspiration below this depth
+const ASPIRATION_MAX_DELTA: i32 = 1500; // give up and use full window beyond this
 
 // ── Move ordering scores ──────────────────────────────────────────────────────
 // Each bucket must be strictly above the one below it to preserve ordering
@@ -193,11 +209,32 @@ impl Evaluator {
 // ── Search context (bundles mutable tables passed through the tree) ───────────
 
 struct SearchContext {
-    tt:      TranspositionTable,
-    killers: KillerTable,
-    history: HistoryTable,
-    nodes:   u64,
-    eval:    Evaluator,
+    tt:             TranspositionTable,
+    killers:        KillerTable,
+    history:        HistoryTable,
+    nodes:          u64,
+    eval:           Evaluator,
+    /// Shared with the TimeManager — set true to stop the search immediately.
+    abort:          Arc<AtomicBool>,
+    /// Nodes between each wall-clock check (power of 2: 2048 normal, 256 panic).
+    check_interval: u64,
+    /// Pre-computed hard deadline; refreshed by the ID loop on time extensions.
+    hard_deadline:  Instant,
+}
+
+impl SearchContext {
+    #[inline]
+    fn aborted(&self) -> bool {
+        self.abort.load(Ordering::Relaxed)
+    }
+
+    /// Wire this context to a new TimeManager before each search.
+    fn prepare(&mut self, tm: &TimeManager) {
+        self.nodes          = 0;
+        self.abort          = tm.abort.clone();
+        self.hard_deadline  = tm.hard_deadline;
+        self.check_interval = if tm.panic_mode { PANIC_CHECK_INTERVAL } else { NORMAL_CHECK_INTERVAL };
+    }
 }
 
 // ── Piece values for move ordering ────────────────────────────────────────────
@@ -297,11 +334,14 @@ impl AlphaBetaEngine {
             depth,
             name,
             ctx: SearchContext {
-                tt:      TranspositionTable::new(),
-                killers: KillerTable::new(),
-                history: HistoryTable::new(),
-                nodes:   0,
+                tt:             TranspositionTable::new(),
+                killers:        KillerTable::new(),
+                history:        HistoryTable::new(),
+                nodes:          0,
                 eval,
+                abort:          Arc::new(AtomicBool::new(false)),
+                check_interval: NORMAL_CHECK_INTERVAL,
+                hard_deadline:  Instant::now() + Duration::from_secs(86_400),
             },
             last_score: None,
         }
@@ -317,45 +357,100 @@ impl AlphaBetaEngine {
 
     pub fn nodes_searched(&self) -> u64 { self.ctx.nodes }
 
-    /// Iterative deepening with a wall-clock deadline. Completes each depth
-    /// before checking the clock, then stops if the deadline has passed.
-    pub fn choose_move_timed(
-        &mut self,
-        board: &Board,
-        deadline: std::time::Instant,
-    ) -> Option<Move> {
+    /// Iterative deepening with dual soft/hard time limits.
+    ///
+    /// * **Soft limit** — checked between depths; if expired, no new depth starts.
+    /// * **Hard limit** — checked every N nodes inside the tree; triggers abort flag.
+    /// * **Aspiration windows** — used from depth 4+; time is extended on failure.
+    /// * Returns the result from the **last fully completed depth** so a partial
+    ///   search aborted mid-tree never corrupts the chosen move.
+    pub fn choose_move_timed(&mut self, board: &Board, mut tm: TimeManager) -> Option<Move> {
         let mut b = board.clone();
         self.ctx.killers = KillerTable::new();
         self.ctx.history.age();
-        self.ctx.nodes = 0;
         self.ctx.eval.init(&b);
-        let mut best = Move::NULL;
+        self.ctx.prepare(&tm);
+
+        let mut best:        Move        = Move::NULL;
+        let mut prev_score:  Option<i32> = None;
         self.last_score = None;
-        for d in 1..=self.depth {
-            if std::time::Instant::now() >= deadline { break; }
-            if let Some((mv, score)) = search_root(&mut b, d, &mut self.ctx) {
-                best = mv;
-                self.last_score = Some(score);
+
+        'id: for d in 1..=self.depth {
+            // ── Soft limit: don't start a new depth if time is running low ────
+            if d > 1 && tm.soft_expired() { break; }
+
+            // ── Aspiration window setup ───────────────────────────────────────
+            let (mut lo, mut hi, mut delta) =
+                if let Some(prev) = prev_score.filter(|_| d >= ASPIRATION_MIN_DEPTH) {
+                    (prev - ASPIRATION_DELTA, prev + ASPIRATION_DELTA, ASPIRATION_DELTA)
+                } else {
+                    (NEG_INF, POS_INF, ASPIRATION_DELTA)
+                };
+
+            // ── Aspiration retry loop ─────────────────────────────────────────
+            let mut aborted = false;
+            loop {
+                let result = search_root(&mut b, d, lo, hi, &mut self.ctx);
+
+                // Hard limit abort (set inside search every N nodes)
+                if self.ctx.aborted() { aborted = true; break; }
+
+                match result {
+                    // No legal moves at root (checkmate / stalemate)
+                    None => break,
+
+                    Some((mv, score)) => {
+                        if score <= lo && lo > NEG_INF {
+                            // ── Fail-low: widen window downward ──────────────
+                            // Also extend time — the position is volatile and
+                            // we need longer to find a stable score.
+                            delta = (delta * 2).min(ASPIRATION_MAX_DELTA);
+                            lo    = lo.saturating_sub(delta).max(NEG_INF);
+                            tm.extend(0.20);
+                            self.ctx.hard_deadline = tm.hard_deadline;
+                            continue;
+                        } else if score >= hi && hi < POS_INF {
+                            // ── Fail-high: widen window upward ───────────────
+                            delta = (delta * 2).min(ASPIRATION_MAX_DELTA);
+                            hi    = hi.saturating_add(delta).min(POS_INF);
+                            continue;
+                        } else {
+                            // ── Score within window: accept this depth ────────
+                            best            = mv;
+                            prev_score      = Some(score);
+                            self.last_score = Some(score);
+                            break;
+                        }
+                    }
+                }
             }
+
+            // Abort detected: discard partial depth, keep last completed result
+            if aborted { break 'id; }
         }
+
         if best.is_null() { None } else { Some(best) }
     }
 }
 
 impl Engine for AlphaBetaEngine {
     fn choose_move(&mut self, board: &Board) -> Option<Move> {
+        let tm = TimeManager::infinite();
         let mut b = board.clone();
         self.ctx.killers = KillerTable::new();
         self.ctx.history.age();
-        self.ctx.nodes = 0;
         self.ctx.eval.init(&b);
+        self.ctx.prepare(&tm);
         let mut best = Move::NULL;
         self.last_score = None;
         for d in 1..=self.depth {
-            if let Some((mv, score)) = search_root(&mut b, d, &mut self.ctx) {
-                best = mv;
-                self.last_score = Some(score);
+            if let Some((mv, score)) = search_root(&mut b, d, NEG_INF, POS_INF, &mut self.ctx) {
+                if !self.ctx.aborted() {
+                    best = mv;
+                    self.last_score = Some(score);
+                }
             }
+            if self.ctx.aborted() { break; }
         }
         if best.is_null() { None } else { Some(best) }
     }
@@ -366,9 +461,19 @@ impl Engine for AlphaBetaEngine {
 }
 
 // ── Root search ───────────────────────────────────────────────────────────────
+//
+// `alpha_in`/`beta` define the aspiration window.  Pass NEG_INF/POS_INF for a
+// full-width search.  Returns None if there are no legal moves.  The returned
+// score is the *actual* best found (not clamped to alpha_in), so the caller
+// can detect fail-low / fail-high and widen the window.
 
-// Returns the best move and its score from the mover's perspective.
-fn search_root(board: &mut Board, depth: u32, ctx: &mut SearchContext) -> Option<(Move, i32)> {
+fn search_root(
+    board:    &mut Board,
+    depth:    u32,
+    alpha_in: i32,
+    beta:     i32,
+    ctx:      &mut SearchContext,
+) -> Option<(Move, i32)> {
     let pseudo = generate_pseudo_legal(board);
     let n = pseudo.len();
     if n == 0 { return None; }
@@ -382,9 +487,11 @@ fn search_root(board: &mut Board, depth: u32, ctx: &mut SearchContext) -> Option
         scores[i] = score_move(board, moves[i], tt_move, &ctx.killers, &ctx.history, 0);
     }
 
-    let us = board.side_to_move;
-    let mut alpha = NEG_INF;
-    let mut best_move = Move::NULL;
+    let us         = board.side_to_move;
+    let mut alpha  = alpha_in;
+    let mut best_move  = Move::NULL;
+    let mut best_score = NEG_INF;  // actual best, even when failing low
+    let mut has_legal  = false;
 
     for i in 0..n {
         // Incremental selection sort: pull best remaining move to position i.
@@ -404,17 +511,25 @@ fn search_root(board: &mut Board, depth: u32, ctx: &mut SearchContext) -> Option
             continue;
         }
 
-        let score = -negamax(board, depth - 1, 1, -POS_INF, -alpha, ctx, true);
+        has_legal = true;
+        let score = -negamax(board, depth - 1, 1, -beta, -alpha, ctx, true);
         board.unmake_move(mv, state);
         ctx.eval.pop();
 
+        // Hard abort: don't update best with a partial/garbage result
+        if ctx.aborted() { break; }
+
+        if score > best_score {
+            best_score = score;
+            best_move  = mv;
+        }
         if score > alpha {
             alpha = score;
-            best_move = mv;
+            if alpha >= beta { break; }   // beta cutoff
         }
     }
 
-    if best_move.is_null() { None } else { Some((best_move, alpha)) }
+    if !has_legal { None } else { Some((best_move, best_score)) }
 }
 
 // ── Negamax with alpha-beta ───────────────────────────────────────────────────
@@ -428,7 +543,22 @@ fn negamax(
     ctx:        &mut SearchContext,
     allow_null: bool,
 ) -> i32 {
+    // ── Abort check ──────────────────────────────────────────────────────────
+    // Fast path: just read the flag.  The flag is set by the periodic clock
+    // check below (every N nodes) or by the ID loop on a soft-limit breach.
+    if ctx.aborted() { return 0; }
+
     ctx.nodes += 1;
+
+    // ── Periodic hard-limit check (avoid expensive clock calls on every node) ─
+    // check_interval is a power of 2, so `& (interval-1)` equals `% interval`.
+    if ctx.nodes & (ctx.check_interval - 1) == 0
+        && Instant::now() >= ctx.hard_deadline
+    {
+        ctx.abort.store(true, Ordering::Relaxed);
+        return 0;
+    }
+
     if depth == 0 {
         return quiescence(board, ply, alpha, beta, ctx);
     }
@@ -570,6 +700,7 @@ fn negamax(
 // evaluating positions at a tactical horizon.
 
 fn quiescence(board: &mut Board, ply: usize, mut alpha: i32, beta: i32, ctx: &mut SearchContext) -> i32 {
+    if ctx.aborted() { return 0; }
     ctx.nodes += 1;
     let in_check = board.is_in_check();
 
