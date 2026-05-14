@@ -92,6 +92,16 @@ def run_validation(
     # Accuracy: does the sign of cp_pred match the sign of cp_true?
     sign_acc   = float(((cp_pred * cp_vals) >= 0).float().mean()) * 100.0
 
+    # Sign accuracy excluding near-equal positions (|cp_true| <= 50 cp)
+    decisive_mask = cp_vals.abs() > 50
+    n_decisive    = int(decisive_mask.sum())
+    if n_decisive > 0:
+        sign_acc_decisive = float(
+            ((cp_pred[decisive_mask] * cp_vals[decisive_mask]) >= 0).float().mean()
+        ) * 100.0
+    else:
+        sign_acc_decisive = float('nan')
+
     # Calibration: bucket probs [0,1] into 10 bins, compare mean pred vs mean target
     bins    = torch.linspace(0, 1, 11)
     cal_err = []
@@ -103,13 +113,15 @@ def run_validation(
     calib_mae = float(np.mean(cal_err)) if cal_err else float('nan')
 
     return {
-        'n_positions': n,
-        'bce_loss':    bce_loss,
-        'mse_cp':      mse_cp,
-        'mae_cp':      mae_cp,
-        'rmse_cp':     math.sqrt(mse_cp),
-        'sign_acc':    sign_acc,
-        'calib_mae':   calib_mae,
+        'n_positions':       n,
+        'bce_loss':          bce_loss,
+        'mse_cp':            mse_cp,
+        'mae_cp':            mae_cp,
+        'rmse_cp':           math.sqrt(mse_cp),
+        'sign_acc':          sign_acc,
+        'sign_acc_decisive': sign_acc_decisive,
+        'n_decisive':        n_decisive,
+        'calib_mae':         calib_mae,
         'elapsed_s':   elapsed,
         'pos_per_sec': n / elapsed,
         # Raw tensors for plotting
@@ -201,6 +213,11 @@ def print_summary(results: dict, ckpt_path: Path, split_name: str) -> None:
     t.add_row('MAE cp',        f'{results["mae_cp"]:.1f}',        'mean abs error in centipawns')
     t.add_row('RMSE cp',       f'{results["rmse_cp"]:.1f}',       'root mean squared error')
     t.add_row('Sign accuracy', f'{results["sign_acc"]:.2f}%',     'correct who is better')
+    decisive_str = (
+        f'{results["sign_acc_decisive"]:.2f}%  ({results["n_decisive"]:,} pos)'
+        if not math.isnan(results["sign_acc_decisive"]) else '—'
+    )
+    t.add_row('Sign acc (|cp|>10)', decisive_str,                 'excl. near-equal positions')
     t.add_row('Calib MAE',     f'{results["calib_mae"]:.4f}',     'win-prob calibration error')
     t.add_row('', '', '')
     t.add_row('Positions/sec', f'{results["pos_per_sec"]:,.0f}', '')
@@ -252,6 +269,7 @@ def find_best(args: argparse.Namespace) -> None:
     results_table.add_column('Val BCE', justify='right')
     results_table.add_column('MAE cp', justify='right')
     results_table.add_column('Sign acc', justify='right')
+    results_table.add_column('Sign acc (|cp|>10)', justify='right')
 
     best_bce   = float('inf')
     best_ckpt  = epoch_ckpts[0]
@@ -269,6 +287,10 @@ def find_best(args: argparse.Namespace) -> None:
             best_ckpt = ckpt_path
             marker    = ' ◀'
 
+        decisive_str = (
+            f'{r["sign_acc_decisive"]:.2f}%'
+            if not math.isnan(r["sign_acc_decisive"]) else '—'
+        )
         results_table.add_row(
             ckpt_path.name + marker,
             str(epoch),
@@ -276,6 +298,7 @@ def find_best(args: argparse.Namespace) -> None:
             f'[bold green]{r["bce_loss"]:.5f}[/]' if marker else f'{r["bce_loss"]:.5f}',
             f'{r["mae_cp"]:.1f}',
             f'{r["sign_acc"]:.2f}%',
+            decisive_str,
         )
         all_scores.append((ckpt_path, r))
 
