@@ -144,14 +144,19 @@ fn make_engine(nnue: &Option<Arc<Nnue>>) -> AlphaBetaEngine {
 
 // ── Main UCI loop ─────────────────────────────────────────────────────────────
 
-pub fn run() {
+pub fn run(use_nnue: bool) {
     let stdin  = io::stdin();
     let stdout = io::stdout();
 
     // Try embedded weights first, then fall back to the runtime path from engine.toml.
-    let nnue: Option<Arc<Nnue>> = Nnue::load_embedded()
-        .or_else(|| Nnue::load(NNUE_PATH).ok())
-        .map(Arc::new);
+    // Pass --no-nnue to force static evaluation regardless of available weights.
+    let nnue: Option<Arc<Nnue>> = if use_nnue {
+        Nnue::load_embedded()
+            .or_else(|| Nnue::load(NNUE_PATH).ok())
+            .map(Arc::new)
+    } else {
+        None
+    };
 
     let mut engine = make_engine(&nnue);
     let mut board  = Board::starting_position();
@@ -163,7 +168,8 @@ pub fn run() {
 
         match line {
             "uci" => {
-                println!("id name rchess");
+                let eval_label = if nnue.is_some() { "NNUE" } else { "static" };
+                println!("id name rchess ({eval_label})");
                 println!("id author augustin101");
                 println!("option name Move Overhead type spin default 30 min 0 max 5000");
                 println!("option name Hash type spin default 16 min 1 max 1024");
