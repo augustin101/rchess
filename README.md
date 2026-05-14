@@ -1,6 +1,6 @@
 # rchess
 
-A small personal chess engine written in Rust. It includes a browser-based UI to play against it locally, and a UCI-compatible binary for use with chess GUIs or bot frameworks like [lichess-bot](https://github.com/lichess-bot-devs/lichess-bot).
+A personal chess engine written in Rust. Includes a browser-based UI to play against it locally and a UCI-compatible binary for chess GUIs or bot frameworks like [lichess-bot](https://github.com/lichess-bot-devs/lichess-bot).
 
 ## Running
 
@@ -14,6 +14,9 @@ cargo run --release
 ```bash
 cargo build --release --bin rchess-uci
 # binary at target/release/rchess-uci
+
+# with NNUE weights embedded (recommended for distribution):
+cargo build --release --bin rchess-uci --features embed-nnue
 ```
 
 ## Tests
@@ -24,7 +27,7 @@ cargo test -- --include-ignored   # include slow perft depths (≥5)
 cargo test perft_start_d4         # run a specific perft test by name
 ```
 
-## Architecture
+## Source layout
 
 ```
 src/
@@ -45,15 +48,27 @@ src/
 │   ├── pst.rs          – Piece-square tables (middlegame + endgame)
 │   ├── alpha_beta.rs   – Iterative-deepening alpha-beta with TT, killers,
 │   │                     history, null-move, futility pruning, LMR, quiescence
+│   ├── nnue.rs         – Quantised dual-perspective NNUE with incremental
+│   │                     accumulator and AVX2/NEON SIMD inference
+│   ├── time_manager.rs – Soft/hard time limits with panic mode
 │   ├── opening_book.rs – Polyglot opening book reader
 │   └── random.rs       – RandomEngine (used for testing)
 ├── uci.rs              – UCI protocol interface
 └── web/
     ├── mod.rs          – Axum REST API + game state
     └── index.html      – Single-page browser UI (vanilla JS)
+training/
+├── model.py            – NNUE PyTorch model (768→256→512→32→32→1)
+├── dataset.py          – Binpack dataset loader
+├── build_binpack.py    – Parquet → compact binary records
+├── shuffle_split.py    – Train/val/test split
+├── train.py            – Training loop with live Rich display
+├── export.py           – Quantise float weights → .bin for the engine
+├── validate.py         – Validation metrics
+└── match.py            – NNUE vs static eval match runner
 ```
 
-### Board representation
+## Board representation
 
 `Board` keeps two views in sync via `put_piece` / `remove_piece`:
 - **Bitboards** — `pieces[color][piece_type]`, `occupancy[color]`, `all_occupancy`
@@ -61,38 +76,39 @@ src/
 
 Squares are indexed a1=0 … h8=63 (bit N in a `Bitboard` = `Square(N)`).
 
-### Move generation
+## Move generation
 
-Slider attacks (rook, bishop, queen) use **magic bitboards**: each square has a `MagicEntry { mask, magic, shift, offset }` indexing into a flat pre-computed table (~102 K rook entries, ~5.3 K bishop entries). Leaper tables (pawn, knight, king) are plain arrays. `generate_pseudo_legal` produces geometrically valid moves; `generate_legal` filters them by verifying the king is not left in check.
+Slider attacks (rook, bishop, queen) use **magic bitboards**: each square has a `MagicEntry { mask, magic, shift, offset }` that maps a blockers bitboard to a pre-computed attacks entry in O(1). Leaper tables (pawn, knight, king) are plain arrays. `generate_pseudo_legal` produces geometrically valid moves; `generate_legal` filters them by verifying the king is not left in check.
 
-### Move encoding
-
-`Move(u16)` packs from-square (6 bits), to-square (6 bits), promotion piece (2 bits), and flag (2 bits: Normal / Promo / EnPassant / Castling). `MoveList` is a stack-allocated `[Move; 256]` — no heap allocation in the hot path.
-
-### Search
+## Search
 
 Iterative-deepening alpha-beta with:
-- Transposition table (1M entries, ~24 MB)
-- Move ordering: TT move → promotions → MVV-LVA captures → killer moves → history heuristic
-- Null-move pruning
-- Futility pruning (depth 1–2)
+- Transposition table (1 M entries, ~24 MB)
+- Aspiration windows (±50 cp, widening on failure)
+- Move ordering: TT move → promotions → MVV-LVA captures → killers → history
+- Null-move pruning (R=2/3)
+- Futility pruning at depth 1–2
 - Late Move Reductions (LMR)
 - Check extensions
 - Quiescence search
+- Threefold-repetition and 50-move rule detection inside search
+- Soft/hard time limits with panic mode
 
-### Evaluation
+## Evaluation
 
-Tapered evaluation interpolating between middlegame and endgame scores based on remaining material:
+Tapered evaluation interpolating between middlegame (MG) and endgame (EG) scores:
 - Material + piece-square tables
 - Pawn structure (doubled, isolated, islands, passed pawns)
 - Rook bonuses (open/semi-open files, 7th rank)
 - Bishop pair
-- King safety (pawn shield, open file exposure)
-- Mobility (squares attacked per piece type)
+- King safety (pawn shield, open-file exposure)
+- Mobility
 
-## NNUE training
+When NNUE weights are available the engine uses a neural network evaluation instead (see below).
 
-The engine supports an optional NNUE evaluation. Trained weights live in `networks/nnue.bin` and are loaded automatically at startup if present.
+## NNUE
+
+A dual-perspective quantised NNUE (768→256→512→32→32→1) trained on Lichess evaluation data. Weights are embedded at compile time with `--features embed-nnue` and updated incrementally during search.
 
 ### Setup
 
@@ -104,41 +120,27 @@ pip install -r training/requirements.txt
 
 Download the [Lichess position evaluation dataset](https://huggingface.co/datasets/Lichess/chess-position-evaluations) parquet files into `data/parquet/`.
 
-### Pipeline (run everything from the project root)
+### Pipeline (run from project root)
 
-**1. Filter & encode** — converts parquet files to compact 196-byte binary records:
 ```bash
-# Full run (~55 min, uses all CPU cores)
+# 1. Filter & encode positions (~55 min full run)
 python training/build_binpack.py
+# smoke test: python training/build_binpack.py --max_rows 1000
 
-# Smoke test — 1 000 rows per file, completes in ~30 s
-python training/build_binpack.py --max_rows 1000
-```
-Output: `data/binpack/shards/shard_00.bin` … `shard_16.bin`
-
-**2. Shuffle & split** — creates fixed validation/test sets and shuffled train shards:
-```bash
+# 2. Shuffle & split into train / val / test
 python training/shuffle_split.py
-```
-Output: `data/binpack/val.bin`, `data/binpack/test.bin`, `data/binpack/train/`  
-The validation set is sampled once with a fixed seed and never changes between runs.
 
-**3. Train**:
-```bash
+# 3. Train
 python training/train.py --splits data/binpack/splits.json
+python training/train.py --splits data/binpack/splits.json --epochs 10 --batch 8192 --lr 1e-3
 
-# Custom hyperparameters
-python training/train.py --splits data/binpack/splits.json \
-    --epochs 10 --batch 8192 --lr 1e-3
-```
-Checkpoints are saved to `checkpoints/`. Loss and learning-rate plots are written to `checkpoints/plots/latest.png` after each epoch.
+# 4. Export quantised weights
+python training/export.py                          # best.pt → networks/nnue.bin
+python training/export.py --ckpt checkpoints/epoch_03.pt --out networks/nnue.bin
 
-**4. Export** — quantises float weights to the binary format read by the Rust engine:
-```bash
-python training/export.py                                    # best checkpoint
-python training/export.py checkpoints/epoch_03.pt networks/nnue.bin
+# 5. Match NNUE vs static eval
+python training/match.py --games 20
 ```
-Output: `networks/nnue.bin` — picked up automatically by `cargo run`.
 
 ### Directory layout
 
@@ -154,17 +156,21 @@ data/
 checkpoints/
 ├── best.pt         – best checkpoint by validation loss
 ├── epoch_NN.pt     – per-epoch checkpoints
+├── resume.pt       – full state for resuming training
 └── plots/          – loss and LR curve PNGs
 networks/
 └── nnue.bin        – exported quantised weights (loaded by the engine)
-training/
-├── build_binpack.py
-├── shuffle_split.py
-├── train.py
-├── export.py
-├── model.py
-└── dataset.py
 ```
+
+## Documentation
+
+Detailed technical documentation lives in `docs/`:
+
+| File | Contents |
+|---|---|
+| [`docs/search.rst`](docs/search.rst) | Alpha-beta, move ordering, pruning, time management |
+| [`docs/eval.rst`](docs/eval.rst) | Tapered static evaluation, all terms and tuning values |
+| [`docs/nnue.rst`](docs/nnue.rst) | NNUE architecture, training loss, quantisation maths, SIMD inference |
 
 ## Requirements
 
