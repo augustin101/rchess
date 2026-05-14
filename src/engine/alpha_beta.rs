@@ -2,11 +2,14 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::core::bitboard::{lsb, EMPTY};
+use crate::core::attacks::{
+    bishop_attacks, king_attacks, knight_attacks, pawn_attacks, queen_attacks, rook_attacks,
+};
+use crate::core::bitboard::{lsb, popcount, square_bb, EMPTY};
 use crate::core::board::Board;
 use crate::core::movegen::generate_pseudo_legal;
 use crate::core::moves::Move;
-use crate::core::types::{Color, PieceType};
+use crate::core::types::{Color, PieceType, Square};
 use super::Engine;
 use super::eval::{static_eval, CHECKMATE_SCORE};
 use super::nnue;
@@ -17,15 +20,6 @@ const POS_INF: i32 =   CHECKMATE_SCORE + 1;
 const MAX_PLY: usize = 64;
 
 // ── Mate-score TT adjustment ──────────────────────────────────────────────────
-// Mate scores encode distance-to-mate from the ROOT (e.g. "mated at ply 5").
-// That root-relative distance must be converted to a node-relative distance
-// when reading/writing the TT so that the same position reached via two paths
-// of different length gets a consistent score.
-//
-//   to_tt  : call before ctx.tt.store  — converts ply-relative → root-relative
-//   from_tt: call after  ctx.tt.probe  — converts root-relative → ply-relative
-//
-// Any score whose absolute value exceeds CHECKMATE_SCORE - MAX_PLY is a mate.
 
 const MATE_THRESHOLD: i32 = CHECKMATE_SCORE - MAX_PLY as i32;
 
@@ -46,12 +40,6 @@ fn from_tt_score(score: i32, ply: usize) -> i32 {
 }
 
 // ── Ply-distance penalty ──────────────────────────────────────────────────────
-// A won position reached at ply 4 is worth more than the same position at ply 12.
-// Subtracting ply from the magnitude forces the engine to prefer faster wins and
-// slower losses, breaking ties between equal-looking endgame moves.
-//
-// The sign-preserving cap ensures a slightly winning position (e.g. +5 cp at ply
-// 20) collapses to 0 rather than flipping to negative — keeping the search sane.
 
 #[inline]
 fn apply_ply_penalty(score: i32, ply: usize) -> i32 {
@@ -61,42 +49,198 @@ fn apply_ply_penalty(score: i32, ply: usize) -> i32 {
 
 // ── Time management ───────────────────────────────────────────────────────────
 
-/// Check the hard deadline every this many nodes (must be a power of 2).
 const NORMAL_CHECK_INTERVAL: u64 = 1024;
-/// Tighter interval when the clock is nearly empty.
 const PANIC_CHECK_INTERVAL:  u64 = 256;
 
 // ── Aspiration windows ────────────────────────────────────────────────────────
 
-const ASPIRATION_DELTA:     i32 = 50;    // initial window half-width (cp)
-const ASPIRATION_MIN_DEPTH: u32 = 4;    // don't use aspiration below this depth
-const ASPIRATION_MAX_DELTA: i32 = 1500; // give up and use full window beyond this
+const ASPIRATION_DELTA:     i32 = 50;
+const ASPIRATION_MIN_DEPTH: u32 = 4;
+const ASPIRATION_MAX_DELTA: i32 = 1500;
 
 // ── Move ordering scores ──────────────────────────────────────────────────────
-// Each bucket must be strictly above the one below it to preserve ordering
-// priority.  Actual values are arbitrary as long as the gaps are wide enough.
-const SCORE_TT_MOVE:      i32 = 30_000_000; // always searched first
-const SCORE_PROMO_BASE:   i32 =  9_000_000; // + piece_value(promo piece)
-const SCORE_CAPTURE_BASE: i32 =  1_000_000; // + MVV-LVA delta
-const SCORE_KILLER:       i32 =    900_000; // below captures, above history
-// History scores live in [0, HISTORY_MAX] and fall below killers naturally.
-const SCORE_QUIET_SKIP:   i32 =         -1; // sentinel: sorted to back, then skipped
+// Buckets (strictly ordered, gaps wide enough to avoid collisions):
+//   TT move → queen promos → good captures (SEE≥0) → killers → countermove →
+//   history [0..HISTORY_MAX] → bad captures (SEE<0) → underpromotions → quiets (sentinel)
+
+const SCORE_TT_MOVE:      i32 = 30_000_000;
+const SCORE_QUEEN_PROMO:  i32 =  9_000_000;
+const SCORE_GOOD_CAPTURE: i32 =  5_000_000; // + SEE (≥ 0)
+const SCORE_KILLER:       i32 =    900_000;
+const SCORE_COUNTERMOVE:  i32 =    800_000;
+// history lives in [0, HISTORY_MAX] = [0, 32_000] — naturally below countermove
 const HISTORY_MAX:        i32 =     32_000;
+const SCORE_BAD_CAPTURE:  i32 = -1_000_000; // + SEE (< 0)
+const SCORE_UNDERPROMO:   i32 = -2_000_000;
+const SCORE_QUIET_SKIP:   i32 = -3_000_000; // sentinel: skipped in qsearch
 
 // ── Search tuning parameters ──────────────────────────────────────────────────
-const NULL_MIN_DEPTH:  u32 = 3; // don't try null move at shallow depths
-const NULL_FULL_DEPTH: u32 = 6; // use larger reduction at this depth and above
-const NULL_R_PARTIAL:  u32 = 2; // reduction below NULL_FULL_DEPTH
-const NULL_R_FULL:     u32 = 3; // reduction at/above NULL_FULL_DEPTH
 
-const FUTILITY_MAX_DEPTH: u32 = 2;   // apply futility pruning only at depth 1-2
-const FUTILITY_MARGIN_1:  i32 = 100; // centipawn margin at depth 1
-const FUTILITY_MARGIN_2:  i32 = 300; // centipawn margin at depth 2
+const NULL_MIN_DEPTH:  u32 = 3;
+const NULL_FULL_DEPTH: u32 = 6;
+const NULL_R_PARTIAL:  u32 = 2;
+const NULL_R_FULL:     u32 = 3;
 
-const LMR_MIN_QUIET: usize = 3; // start reducing after this many quiet moves
-const LMR_MIN_DEPTH: u32   = 3; // don't reduce at shallow depths
+const FUTILITY_MAX_DEPTH: u32 = 2;
+const FUTILITY_MARGIN_1:  i32 = 100;
+const FUTILITY_MARGIN_2:  i32 = 300;
 
-// ── Transposition Table ───────────────────────────────────────────────────────
+// Reverse futility pruning: if eval ≥ beta + margin×depth, prune
+const RFP_MAX_DEPTH: u32 = 6;
+const RFP_MARGIN:    i32 = 70;
+
+const LMR_MIN_QUIET: usize = 3;
+const LMR_MIN_DEPTH: u32   = 3;
+
+// Late move pruning thresholds: skip quiet moves after this many searched at low depth
+const LMP_MAX_DEPTH:  u32 = 4;
+const LMP_THRESHOLDS: [usize; 5] = [0, 4, 8, 14, 20];
+
+// SEE pruning: skip moves with SEE below threshold (scaled by depth)
+const SEE_QUIET_MARGIN: i32 = -60;  // per depth, quiet moves
+const SEE_CAPT_MARGIN:  i32 = -90;  // per depth, capture moves
+
+// Qsearch delta pruning: skip captures that can't raise alpha even with a bonus
+const DELTA_MARGIN: i32 = 200;
+
+// ── Static Exchange Evaluation ────────────────────────────────────────────────
+
+const SEE_VALUES: [i32; 6] = [100, 300, 300, 500, 900, 20_000]; // P N B R Q K
+
+/// Least-valuable attacker of `stm` on `sq` given the live occupancy `occ`.
+/// Returns `(attacker_bitboard_lsb, piece_type)`, or `None` if no attacker.
+/// Slider attacks are recomputed through `occ` so x-rays are handled correctly.
+fn least_valuable_attacker(
+    board: &Board,
+    sq:    Square,
+    stm:   Color,
+    occ:   u64,
+) -> Option<(u64, PieceType)> {
+    let s = stm as usize;
+
+    // Pawns: a stm-pawn on X attacks sq iff sq ∈ pawn_attacks(stm, X),
+    // equivalently X ∈ pawn_attacks(stm.flip(), sq).
+    let pawns = board.pieces[s][PieceType::Pawn as usize] & occ;
+    let pa    = pawn_attacks(stm.flip(), sq) & pawns;
+    if pa != EMPTY { return Some((pa & pa.wrapping_neg(), PieceType::Pawn)); }
+
+    let knights = board.pieces[s][PieceType::Knight as usize] & occ;
+    let na      = knight_attacks(sq) & knights;
+    if na != EMPTY { return Some((na & na.wrapping_neg(), PieceType::Knight)); }
+
+    let bishops = board.pieces[s][PieceType::Bishop as usize] & occ;
+    let ba      = bishop_attacks(sq, occ) & bishops;
+    if ba != EMPTY { return Some((ba & ba.wrapping_neg(), PieceType::Bishop)); }
+
+    let rooks = board.pieces[s][PieceType::Rook as usize] & occ;
+    let ra    = rook_attacks(sq, occ) & rooks;
+    if ra != EMPTY { return Some((ra & ra.wrapping_neg(), PieceType::Rook)); }
+
+    let queens = board.pieces[s][PieceType::Queen as usize] & occ;
+    let qa     = queen_attacks(sq, occ) & queens;
+    if qa != EMPTY { return Some((qa & qa.wrapping_neg(), PieceType::Queen)); }
+
+    let kings = board.pieces[s][PieceType::King as usize] & occ;
+    let ka    = king_attacks(sq) & kings;
+    if ka != EMPTY { return Some((ka & ka.wrapping_neg(), PieceType::King)); }
+
+    None
+}
+
+/// Static exchange evaluation — expected net material gain for the moving side.
+/// Positive = winning exchange, negative = losing exchange.
+/// Uses the recursive minimax gain-array technique with x-ray support.
+fn see(board: &Board, mv: Move) -> i32 {
+    let to   = mv.to_sq();
+    let from = mv.from_sq();
+
+    let mut occ = board.all_occupancy;
+    occ ^= square_bb(from); // moving piece is no longer on its origin
+
+    // Value of the initially captured piece
+    let captured_val = if mv.is_en_passant() {
+        // captured pawn sits one rank behind the target square
+        let ep_sq = Square(if board.side_to_move == Color::White {
+            to.0 - 8
+        } else {
+            to.0 + 8
+        });
+        occ ^= square_bb(ep_sq);
+        SEE_VALUES[PieceType::Pawn as usize]
+    } else {
+        board.piece_at(to).map_or(0, |p| SEE_VALUES[p.piece_type as usize])
+    };
+
+    // Value of the piece that just moved to `to` (can now be recaptured)
+    let mut next_on_to = if mv.is_promo() {
+        SEE_VALUES[mv.promo_piece_type() as usize]
+    } else {
+        board.piece_at(from).map_or(SEE_VALUES[0], |p| SEE_VALUES[p.piece_type as usize])
+    };
+
+    // gain[i] = value of the piece captured at recapture step i.
+    // Recaptures alternate sides; the first recapture is by board.side_to_move.flip().
+    let mut gain = [0i32; 32];
+    let mut d    = 0usize;
+    let mut stm  = board.side_to_move.flip();
+
+    loop {
+        let Some((lva_bb, lva_pt)) = least_valuable_attacker(board, to, stm, occ) else { break };
+        if d >= gain.len() - 1 { break; }
+
+        gain[d]  = next_on_to;   // the piece currently on `to` is the new victim
+        d       += 1;
+        occ     ^= lva_bb;       // lva moves to `to`; remove from occupancy
+        next_on_to = SEE_VALUES[lva_pt as usize];
+        stm      = stm.flip();
+    }
+
+    // Negamax: each side can choose not to recapture (take max(0, gain) at each step).
+    // Unroll from the deepest ply backward.
+    let mut result = 0i32;
+    for i in (0..d).rev() {
+        result = (gain[i] - result).max(0);
+    }
+
+    captured_val - result
+}
+
+// ── Insufficient material detection ──────────────────────────────────────────
+
+fn is_insufficient_material(board: &Board) -> bool {
+    // Any pawn, rook, or queen → mating material exists
+    for c in 0..2 {
+        if board.pieces[c][PieceType::Pawn  as usize] != EMPTY { return false; }
+        if board.pieces[c][PieceType::Rook  as usize] != EMPTY { return false; }
+        if board.pieces[c][PieceType::Queen as usize] != EMPTY { return false; }
+    }
+
+    let w_minor = popcount(
+        board.pieces[0][PieceType::Knight as usize] |
+        board.pieces[0][PieceType::Bishop as usize],
+    ) as usize;
+    let b_minor = popcount(
+        board.pieces[1][PieceType::Knight as usize] |
+        board.pieces[1][PieceType::Bishop as usize],
+    ) as usize;
+
+    // K vs K, K+1 minor vs K, K vs K+1 minor
+    if w_minor + b_minor <= 1 { return true; }
+
+    // K+B vs K+B: draw only when bishops share square color
+    if w_minor == 1 && b_minor == 1 {
+        let wb = board.pieces[0][PieceType::Bishop as usize];
+        let bb = board.pieces[1][PieceType::Bishop as usize];
+        if wb != EMPTY && bb != EMPTY {
+            const LIGHT: u64 = 0x55AA_55AA_55AA_55AA;
+            return (wb & LIGHT != EMPTY) == (bb & LIGHT != EMPTY);
+        }
+    }
+
+    false
+}
+
+// ── Transposition Table (4 entries per bucket) ────────────────────────────────
 
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 #[repr(u8)]
@@ -104,47 +248,89 @@ enum Bound { #[default] None, Exact, Lower, Upper }
 
 #[derive(Clone, Copy, Default)]
 struct TtEntry {
-    hash:      u64,
-    score:     i32,
-    best_move: Move,
-    depth:     u8,
-    bound:     Bound,
+    hash:       u64,
+    score:      i32,
+    best_move:  Move,
+    depth:      u8,
+    bound:      Bound,
+    generation: u8,
 }
 
-// 1M entries × 24 bytes ≈ 24 MB
-const TT_SIZE: usize = 1 << 20;
+const BUCKET_SIZE:  usize = 4;
+const BUCKET_COUNT: usize = 1 << 18; // 256 K buckets × 4 = 1 M entries ≈ 16 MB
+
+#[derive(Clone, Copy, Default)]
+struct TtBucket {
+    entries: [TtEntry; BUCKET_SIZE],
+}
 
 struct TranspositionTable {
-    entries: Box<[TtEntry]>,
+    buckets:    Box<[TtBucket]>,
+    generation: u8,
 }
 
 impl TranspositionTable {
     fn new() -> Self {
-        Self { entries: vec![TtEntry::default(); TT_SIZE].into_boxed_slice() }
+        Self {
+            buckets:    vec![TtBucket::default(); BUCKET_COUNT].into_boxed_slice(),
+            generation: 0,
+        }
+    }
+
+    fn new_search(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
     }
 
     #[inline]
     fn probe(&self, hash: u64, depth: u32) -> Option<TtEntry> {
-        let e = self.entries[(hash as usize) & (TT_SIZE - 1)];
-        if e.bound != Bound::None && e.hash == hash && u32::from(e.depth) >= depth {
-            Some(e)
-        } else {
-            None
+        for e in &self.buckets[(hash as usize) & (BUCKET_COUNT - 1)].entries {
+            if e.bound != Bound::None && e.hash == hash && u32::from(e.depth) >= depth {
+                return Some(*e);
+            }
         }
+        None
     }
 
+    /// Return the best move stored for this position regardless of depth.
     #[inline]
     fn probe_move(&self, hash: u64) -> Move {
-        let e = self.entries[(hash as usize) & (TT_SIZE - 1)];
-        if e.bound != Bound::None && e.hash == hash { e.best_move } else { Move::NULL }
+        for e in &self.buckets[(hash as usize) & (BUCKET_COUNT - 1)].entries {
+            if e.bound != Bound::None && e.hash == hash {
+                return e.best_move;
+            }
+        }
+        Move::NULL
     }
 
     #[inline]
     fn store(&mut self, hash: u64, depth: u32, score: i32, bound: Bound, best_move: Move) {
-        let slot = &mut self.entries[(hash as usize) & (TT_SIZE - 1)];
-        if slot.bound == Bound::None || slot.hash == hash || depth >= u32::from(slot.depth) {
-            *slot = TtEntry { hash, score, best_move, depth: depth as u8, bound };
+        let cur_gen = self.generation;
+        let bucket  = &mut self.buckets[(hash as usize) & (BUCKET_COUNT - 1)];
+
+        // Replacement: always update same-hash entry; otherwise evict lowest-quality slot.
+        // Quality = depth, penalised heavily for stale generations.
+        let mut replace_idx   = 0;
+        let mut replace_score = i32::MAX;
+
+        for (i, e) in bucket.entries.iter().enumerate() {
+            if e.hash == hash {
+                replace_idx = i;
+                break;
+            }
+            let age_penalty = if e.generation != cur_gen { 8 } else { 0 };
+            let q = e.depth as i32 - age_penalty;
+            if q < replace_score {
+                replace_score = q;
+                replace_idx   = i;
+            }
         }
+
+        let slot = &mut bucket.entries[replace_idx];
+        // Don't clobber a deeper same-generation entry unless it's our own hash
+        if slot.hash != hash && slot.generation == cur_gen && u32::from(slot.depth) > depth {
+            return;
+        }
+        *slot = TtEntry { hash, score, best_move, depth: depth as u8, bound, generation: cur_gen };
     }
 }
 
@@ -159,10 +345,7 @@ impl KillerTable {
     fn update(&mut self, mv: Move, ply: usize) {
         if ply >= MAX_PLY { return; }
         let slot = &mut self.0[ply];
-        if slot[0] != mv {
-            slot[1] = slot[0];
-            slot[0] = mv;
-        }
+        if slot[0] != mv { slot[1] = slot[0]; slot[0] = mv; }
     }
 
     #[inline]
@@ -194,11 +377,30 @@ impl HistoryTable {
     fn age(&mut self) {
         for c in &mut self.0 {
             for f in c.iter_mut() {
-                for v in f.iter_mut() {
-                    *v >>= 1;
-                }
+                for v in f.iter_mut() { *v >>= 1; }
             }
         }
+    }
+}
+
+// ── Countermove heuristic ─────────────────────────────────────────────────────
+// For each opponent move (from→to), store the quiet move that refuted it.
+
+struct CountermoveTable([[Move; 64]; 64]);
+
+impl CountermoveTable {
+    fn new() -> Self { CountermoveTable([[Move::NULL; 64]; 64]) }
+
+    #[inline]
+    fn get(&self, prev: Move) -> Move {
+        if prev.is_null() { return Move::NULL; }
+        self.0[prev.from_sq().0 as usize][prev.to_sq().0 as usize]
+    }
+
+    #[inline]
+    fn update(&mut self, prev: Move, mv: Move) {
+        if prev.is_null() { return; }
+        self.0[prev.from_sq().0 as usize][prev.to_sq().0 as usize] = mv;
     }
 }
 
@@ -221,27 +423,23 @@ impl Evaluator {
         }
     }
 
-    /// Refresh the accumulator at the root of a new search.
     fn init(&mut self, board: &Board) {
         let Evaluator::Nnue { weights, stack } = self else { return };
         stack.init(weights, board);
     }
 
-    /// Push + apply move delta (call BEFORE board.make_move).
     #[inline]
     fn push_move(&mut self, board: &Board, mv: Move) {
         let Evaluator::Nnue { weights, stack } = self else { return };
         stack.push_move(weights, board, mv);
     }
 
-    /// Push for null moves (no piece changes).
     #[inline]
     fn push_null(&mut self) {
         let Evaluator::Nnue { weights: _, stack } = self else { return };
         stack.push_null();
     }
 
-    /// Pop (call AFTER board.unmake_move).
     #[inline]
     fn pop(&mut self) {
         let Evaluator::Nnue { weights: _, stack } = self else { return };
@@ -249,67 +447,36 @@ impl Evaluator {
     }
 }
 
-// ── Search context (bundles mutable tables passed through the tree) ───────────
+// ── Search context ────────────────────────────────────────────────────────────
 
 struct SearchContext {
-    tt:             TranspositionTable,
-    killers:        KillerTable,
-    history:        HistoryTable,
-    nodes:          u64,
-    eval:           Evaluator,
-    /// Shared with the TimeManager — set true to stop the search immediately.
-    abort:          Arc<AtomicBool>,
-    /// Nodes between each wall-clock check.
-    check_interval: u64,
-    /// Pre-computed hard deadline; refreshed by the ID loop on time extensions.
-    hard_deadline:  Instant,
-    /// Position hashes for threefold-repetition detection.
-    /// Layout: [game history before search root] ++ [current search path ancestors].
+    tt:               TranspositionTable,
+    killers:          KillerTable,
+    history:          HistoryTable,
+    countermoves:     CountermoveTable,
+    nodes:            u64,
+    eval:             Evaluator,
+    abort:            Arc<AtomicBool>,
+    check_interval:   u64,
+    hard_deadline:    Instant,
     position_history: Vec<u64>,
-    /// Number of entries that belong to the game history (before the search root).
     game_history_len: usize,
 }
 
 impl SearchContext {
     #[inline]
-    fn aborted(&self) -> bool {
-        self.abort.load(Ordering::Relaxed)
-    }
+    fn aborted(&self) -> bool { self.abort.load(Ordering::Relaxed) }
 
-    /// Wire this context to a new TimeManager before each search.
     fn prepare(&mut self, tm: &TimeManager) {
         self.nodes          = 0;
         self.abort          = tm.abort.clone();
         self.hard_deadline  = tm.hard_deadline;
         self.check_interval = if tm.panic_mode { PANIC_CHECK_INTERVAL } else { NORMAL_CHECK_INTERVAL };
+        self.tt.new_search();
     }
 }
 
-// ── Piece values for move ordering ────────────────────────────────────────────
-
-#[inline]
-fn piece_value(pt: PieceType) -> i32 {
-    match pt {
-        PieceType::Pawn   =>   100,
-        PieceType::Knight =>   320,
-        PieceType::Bishop =>   330,
-        PieceType::Rook   =>   500,
-        PieceType::Queen  =>   900,
-        PieceType::King   => 10_000,
-    }
-}
-
-// ── MVV-LVA capture score ─────────────────────────────────────────────────────
-// For en passant, piece_at(to_sq) is None; the pawn default (100) is correct.
-
-#[inline]
-fn capture_mvv_lva(board: &Board, mv: Move) -> i32 {
-    let vv = board.piece_at(mv.to_sq()).map_or(100, |p| piece_value(p.piece_type));
-    let av = board.piece_at(mv.from_sq()).map_or(100, |p| piece_value(p.piece_type));
-    SCORE_CAPTURE_BASE + vv * 10 - av
-}
-
-// ── LMR reduction depth ───────────────────────────────────────────────────────
+// ── LMR reduction ─────────────────────────────────────────────────────────────
 
 #[inline]
 fn lmr_reduction(quiet_count: usize) -> u32 {
@@ -317,28 +484,39 @@ fn lmr_reduction(quiet_count: usize) -> u32 {
 }
 
 // ── Move scoring ──────────────────────────────────────────────────────────────
-// Priority: TT/hash move > promotions > captures (MVV-LVA) > killers > history
 
 #[inline]
 fn score_move(
-    board:   &Board,
-    mv:      Move,
-    tt_move: Move,
-    killers: &KillerTable,
-    history: &HistoryTable,
-    ply:     usize,
+    board:       &Board,
+    mv:          Move,
+    tt_move:     Move,
+    killers:     &KillerTable,
+    countermove: Move,
+    history:     &HistoryTable,
+    ply:         usize,
 ) -> i32 {
     if mv == tt_move { return SCORE_TT_MOVE; }
-    if mv.is_promo() { return SCORE_PROMO_BASE + piece_value(mv.promo_piece_type()); }
-    if board.piece_at(mv.to_sq()).is_some() || mv.is_en_passant() {
-        return capture_mvv_lva(board, mv);
+
+    if mv.is_promo() {
+        return if mv.promo_piece_type() == PieceType::Queen {
+            SCORE_QUEEN_PROMO
+        } else {
+            SCORE_UNDERPROMO
+        };
     }
+
+    if board.piece_at(mv.to_sq()).is_some() || mv.is_en_passant() {
+        let s = see(board, mv);
+        return if s >= 0 { SCORE_GOOD_CAPTURE + s } else { SCORE_BAD_CAPTURE + s };
+    }
+
+    // Quiet move
     if killers.is_killer(mv, ply) { return SCORE_KILLER; }
+    if mv == countermove           { return SCORE_COUNTERMOVE; }
     history.get(board.side_to_move, mv.from_sq().0, mv.to_sq().0)
 }
 
 // ── Null-move safety check ────────────────────────────────────────────────────
-// Avoid null move in pure pawn + king endings to reduce zugzwang risk.
 
 #[inline]
 fn has_non_pawn_material(board: &Board) -> bool {
@@ -385,6 +563,7 @@ impl AlphaBetaEngine {
                 tt:               TranspositionTable::new(),
                 killers:          KillerTable::new(),
                 history:          HistoryTable::new(),
+                countermoves:     CountermoveTable::new(),
                 nodes:            0,
                 eval,
                 abort:            Arc::new(AtomicBool::new(false)),
@@ -407,13 +586,6 @@ impl AlphaBetaEngine {
 
     pub fn nodes_searched(&self) -> u64 { self.ctx.nodes }
 
-    /// Iterative deepening with dual soft/hard time limits.
-    ///
-    /// * **Soft limit** — checked between depths; if expired, no new depth starts.
-    /// * **Hard limit** — checked every N nodes inside the tree; triggers abort flag.
-    /// * **Aspiration windows** — used from depth 4+; time is extended on failure.
-    /// * Returns the result from the **last fully completed depth** so a partial
-    ///   search aborted mid-tree never corrupts the chosen move.
     pub fn choose_move_timed(
         &mut self,
         board:        &Board,
@@ -421,7 +593,8 @@ impl AlphaBetaEngine {
         game_history: &[u64],
     ) -> Option<Move> {
         let mut b = board.clone();
-        self.ctx.killers = KillerTable::new();
+        self.ctx.killers      = KillerTable::new();
+        self.ctx.countermoves = CountermoveTable::new();
         self.ctx.history.age();
         self.ctx.eval.init(&b);
         self.ctx.prepare(&tm);
@@ -429,15 +602,13 @@ impl AlphaBetaEngine {
         self.ctx.position_history.extend_from_slice(game_history);
         self.ctx.game_history_len = game_history.len();
 
-        let mut best:        Move        = Move::NULL;
-        let mut prev_score:  Option<i32> = None;
+        let mut best:       Move        = Move::NULL;
+        let mut prev_score: Option<i32> = None;
         self.last_score = None;
 
         'id: for d in 1..=self.depth {
-            // ── Soft limit: don't start a new depth if time is running low ────
             if d > 1 && tm.soft_expired() { break; }
 
-            // ── Aspiration window setup ───────────────────────────────────────
             let (mut lo, mut hi, mut delta) =
                 if let Some(prev) = prev_score.filter(|_| d >= ASPIRATION_MIN_DEPTH) {
                     (prev - ASPIRATION_DELTA, prev + ASPIRATION_DELTA, ASPIRATION_DELTA)
@@ -445,35 +616,26 @@ impl AlphaBetaEngine {
                     (NEG_INF, POS_INF, ASPIRATION_DELTA)
                 };
 
-            // ── Aspiration retry loop ─────────────────────────────────────────
             let mut aborted = false;
             loop {
                 let result = search_root(&mut b, d, lo, hi, &mut self.ctx);
 
-                // Hard limit abort (set inside search every N nodes)
                 if self.ctx.aborted() { aborted = true; break; }
 
                 match result {
-                    // No legal moves at root (checkmate / stalemate)
                     None => break,
-
                     Some((mv, score)) => {
                         if score <= lo && lo > NEG_INF {
-                            // ── Fail-low: widen window downward ──────────────
-                            // Also extend time — the position is volatile and
-                            // we need longer to find a stable score.
                             delta = (delta * 2).min(ASPIRATION_MAX_DELTA);
                             lo    = lo.saturating_sub(delta).max(NEG_INF);
                             tm.extend(0.20);
                             self.ctx.hard_deadline = tm.hard_deadline;
                             continue;
                         } else if score >= hi && hi < POS_INF {
-                            // ── Fail-high: widen window upward ───────────────
                             delta = (delta * 2).min(ASPIRATION_MAX_DELTA);
                             hi    = hi.saturating_add(delta).min(POS_INF);
                             continue;
                         } else {
-                            // ── Score within window: accept this depth ────────
                             best            = mv;
                             prev_score      = Some(score);
                             self.last_score = Some(score);
@@ -483,7 +645,6 @@ impl AlphaBetaEngine {
                 }
             }
 
-            // Abort detected: discard partial depth, keep last completed result
             if aborted { break 'id; }
         }
 
@@ -495,7 +656,8 @@ impl Engine for AlphaBetaEngine {
     fn choose_move(&mut self, board: &Board) -> Option<Move> {
         let tm = TimeManager::infinite();
         let mut b = board.clone();
-        self.ctx.killers = KillerTable::new();
+        self.ctx.killers      = KillerTable::new();
+        self.ctx.countermoves = CountermoveTable::new();
         self.ctx.history.age();
         self.ctx.eval.init(&b);
         self.ctx.prepare(&tm);
@@ -521,11 +683,6 @@ impl Engine for AlphaBetaEngine {
 }
 
 // ── Root search ───────────────────────────────────────────────────────────────
-//
-// `alpha_in`/`beta` define the aspiration window.  Pass NEG_INF/POS_INF for a
-// full-width search.  Returns None if there are no legal moves.  The returned
-// score is the *actual* best found (not clamped to alpha_in), so the caller
-// can detect fail-low / fail-high and widen the window.
 
 fn search_root(
     board:    &mut Board,
@@ -544,17 +701,17 @@ fn search_root(
 
     let tt_move = ctx.tt.probe_move(board.hash);
     for i in 0..n {
-        scores[i] = score_move(board, moves[i], tt_move, &ctx.killers, &ctx.history, 0);
+        // At root we don't have a countermove context; pass NULL
+        scores[i] = score_move(board, moves[i], tt_move, &ctx.killers, Move::NULL, &ctx.history, 0);
     }
 
-    let us         = board.side_to_move;
-    let mut alpha  = alpha_in;
+    let us          = board.side_to_move;
+    let mut alpha   = alpha_in;
     let mut best_move  = Move::NULL;
-    let mut best_score = NEG_INF;  // actual best, even when failing low
-    let mut has_legal  = false;
+    let mut best_score = NEG_INF;
+    let mut legal_count = 0usize;
 
     for i in 0..n {
-        // Incremental selection sort: pull best remaining move to position i.
         let mut bi = i;
         for j in (i + 1)..n { if scores[j] > scores[bi] { bi = j; } }
         moves.swap(i, bi);
@@ -573,13 +730,21 @@ fn search_root(
             continue;
         }
 
-        has_legal = true;
-        let score = -negamax(board, depth - 1, 1, -beta, -alpha, ctx, true);
+        legal_count += 1;
+        let score = if legal_count == 1 {
+            -negamax(board, depth - 1, 1, -beta, -alpha, ctx, true, mv)
+        } else {
+            // PVS: null-window first
+            let s = -negamax(board, depth - 1, 1, -alpha - 1, -alpha, ctx, true, mv);
+            if s > alpha && s < beta {
+                -negamax(board, depth - 1, 1, -beta, -alpha, ctx, true, mv)
+            } else { s }
+        };
+
         board.unmake_move(mv, state);
         ctx.eval.pop();
         ctx.position_history.pop();
 
-        // Hard abort: don't update best with a partial/garbage result
         if ctx.aborted() { break; }
 
         if score > best_score {
@@ -588,11 +753,11 @@ fn search_root(
         }
         if score > alpha {
             alpha = score;
-            if alpha >= beta { break; }   // beta cutoff
+            if alpha >= beta { break; }
         }
     }
 
-    if !has_legal { None } else { Some((best_move, best_score)) }
+    if legal_count == 0 { None } else { Some((best_move, best_score)) }
 }
 
 // ── Negamax with alpha-beta ───────────────────────────────────────────────────
@@ -605,16 +770,12 @@ fn negamax(
     mut beta:   i32,
     ctx:        &mut SearchContext,
     allow_null: bool,
+    prev_move:  Move,   // opponent's last move (for countermove lookup)
 ) -> i32 {
-    // ── Abort check ──────────────────────────────────────────────────────────
-    // Fast path: just read the flag.  The flag is set by the periodic clock
-    // check below (every N nodes) or by the ID loop on a soft-limit breach.
     if ctx.aborted() { return 0; }
 
     ctx.nodes += 1;
 
-    // ── Periodic hard-limit check (avoid expensive clock calls on every node) ─
-    // check_interval is a power of 2, so `& (interval-1)` equals `% interval`.
     if ctx.nodes & (ctx.check_interval - 1) == 0
         && Instant::now() >= ctx.hard_deadline
     {
@@ -623,12 +784,9 @@ fn negamax(
     }
 
     // ── Draw detection ────────────────────────────────────────────────────────
-    // 50-move rule: 100 half-moves without a pawn move or capture.
     if board.half_move_clock >= 100 { return 0; }
+    if is_insufficient_material(board) { return 0; }
 
-    // Threefold repetition:
-    //   • game_reps >= 2 → position seen twice before the search root (3rd here)
-    //   • search_reps >= 1 → position seen once in current search path (engine cycling)
     {
         let gl          = ctx.game_history_len;
         let game_reps   = ctx.position_history[..gl].iter().filter(|&&h| h == board.hash).count();
@@ -656,61 +814,105 @@ fn negamax(
         None => ctx.tt.probe_move(board.hash),
     };
 
-    let in_check = board.is_in_check();
+    let in_check  = board.is_in_check();
+    let is_pv     = beta > alpha + 1; // full-window node
 
-    // ── Null move pruning ─────────────────────────────────────────────────────
-    // Skip our turn; if the score is still >= beta the position is strong
-    // enough that we can prune.  Disabled in check and pawn/king endgames
-    // (zugzwang risk).
-    if allow_null && !in_check && depth >= NULL_MIN_DEPTH && has_non_pawn_material(board) {
-        let r = if depth >= NULL_FULL_DEPTH { NULL_R_FULL } else { NULL_R_PARTIAL };
-        ctx.eval.push_null();
-        let ns = board.make_null_move();
-        let null_score = -negamax(board, depth - 1 - r, ply + 1, -beta, -beta + 1, ctx, false);
-        board.unmake_null_move(ns);
-        ctx.eval.pop();
-        if null_score >= beta {
-            return beta;
+    // ── Static eval (shared by RFP + futility) ────────────────────────────────
+    // Avoid calling eval when in check (position is unstable).
+    let static_eval = if !in_check { Some(ctx.eval.eval_stm(board)) } else { None };
+
+    // ── Reverse futility pruning ──────────────────────────────────────────────
+    // If the position is so good that even giving up a margin won't drop below
+    // beta, we can prune the whole subtree.
+    if !is_pv && !in_check && depth <= RFP_MAX_DEPTH {
+        if let Some(eval) = static_eval {
+            if eval >= beta + RFP_MARGIN * depth as i32 {
+                return eval;
+            }
         }
     }
 
-    // ── Futility pruning ──────────────────────────────────────────────────────
-    // At depth 1-2, if the static eval is far below alpha, quiet moves are
-    // unlikely to recover; skip them.
+    // ── Null move pruning ─────────────────────────────────────────────────────
+    if allow_null && !in_check && !is_pv && depth >= NULL_MIN_DEPTH && has_non_pawn_material(board) {
+        if let Some(eval) = static_eval {
+            if eval >= beta {
+                let r = if depth >= NULL_FULL_DEPTH { NULL_R_FULL } else { NULL_R_PARTIAL };
+                ctx.eval.push_null();
+                let ns = board.make_null_move();
+                let null_score = -negamax(board, depth - 1 - r, ply + 1, -beta, -beta + 1, ctx, false, Move::NULL);
+                board.unmake_null_move(ns);
+                ctx.eval.pop();
+                if null_score >= beta {
+                    return beta;
+                }
+            }
+        }
+    }
+
+    // ── Futility pruning flag ─────────────────────────────────────────────────
     let futility_prunable = !in_check && depth <= FUTILITY_MAX_DEPTH && {
-        let eval   = ctx.eval.eval_stm(board);
+        let eval   = static_eval.unwrap_or_else(|| ctx.eval.eval_stm(board));
         let margin = if depth == 1 { FUTILITY_MARGIN_1 } else { FUTILITY_MARGIN_2 };
         eval + margin < alpha
     };
 
     // ── Generate and score moves ──────────────────────────────────────────────
     let pseudo = generate_pseudo_legal(board);
-    let n = pseudo.len();
+    let n      = pseudo.len();
     let mut moves  = [Move::NULL; 256];
     let mut scores = [0i32; 256];
     moves[..n].copy_from_slice(pseudo.as_slice());
+
+    let countermove = ctx.countermoves.get(prev_move);
     for i in 0..n {
-        scores[i] = score_move(board, moves[i], tt_move, &ctx.killers, &ctx.history, ply);
+        scores[i] = score_move(board, moves[i], tt_move, &ctx.killers, countermove, &ctx.history, ply);
     }
 
-    let us = board.side_to_move;
+    let us           = board.side_to_move;
     let mut best      = NEG_INF;
     let mut best_move = Move::NULL;
-    let mut has_legal = false;
-    let mut quiet_count = 0usize;
+    let mut legal_count  = 0usize;
+    let mut quiet_searched = 0usize; // legal quiet moves searched (for LMR/LMP)
 
     for i in 0..n {
-        // Incremental selection sort: pull best remaining move to position i.
         let mut bi = i;
         for j in (i + 1)..n { if scores[j] > scores[bi] { bi = j; } }
         moves.swap(i, bi);
         scores.swap(i, bi);
 
-        let mv = moves[i];
+        let mv        = moves[i];
+        let mv_score  = scores[i];
         let is_capture = board.piece_at(mv.to_sq()).is_some() || mv.is_en_passant();
         let is_quiet   = !is_capture && !mv.is_promo();
 
+        // ── Futility pruning ──────────────────────────────────────────────────
         if futility_prunable && is_quiet { continue; }
+
+        // ── Late move pruning (pre-make, based on move score) ─────────────────
+        if !in_check && is_quiet && depth <= LMP_MAX_DEPTH
+            && quiet_searched >= LMP_THRESHOLDS[depth as usize]
+            && mv != tt_move
+        {
+            quiet_searched += 1;
+            continue;
+        }
+
+        // ── SEE pruning ───────────────────────────────────────────────────────
+        // Skip moves with clearly losing exchanges at non-root, non-PV nodes.
+        if legal_count > 0 && !in_check && !is_pv {
+            let threshold = if is_quiet {
+                SEE_QUIET_MARGIN * depth as i32
+            } else {
+                SEE_CAPT_MARGIN * depth as i32
+            };
+            // For captures the score already encodes SEE; re-use it.
+            if is_capture && mv_score < SCORE_GOOD_CAPTURE && mv_score - SCORE_BAD_CAPTURE < threshold {
+                continue;
+            }
+            if is_quiet && mv_score < threshold {
+                continue;
+            }
+        }
 
         ctx.position_history.push(board.hash);
         ctx.eval.push_move(board, mv);
@@ -724,35 +926,49 @@ fn negamax(
             continue;
         }
 
-        has_legal = true;
+        legal_count += 1;
+        if is_quiet { quiet_searched += 1; }
+
         let gives_check = board.is_in_check();
-
-        // ── Check extension ───────────────────────────────────────────────────
         let extension: u32 = if gives_check && ply < MAX_PLY - 1 { 1 } else { 0 };
+        let new_depth = depth - 1 + extension;
 
-        // ── Late Move Reductions (LMR) ────────────────────────────────────────
-        let score = if is_quiet && !gives_check && extension == 0
-            && quiet_count >= LMR_MIN_QUIET && depth >= LMR_MIN_DEPTH
-        {
-            let reduced = (depth + extension).saturating_sub(1 + lmr_reduction(quiet_count));
-            let s = -negamax(board, reduced, ply + 1, -alpha - 1, -alpha, ctx, true);
-            if s > alpha {
-                -negamax(board, depth - 1 + extension, ply + 1, -beta, -alpha, ctx, true)
-            } else {
-                s
-            }
+        // ── PVS + LMR ─────────────────────────────────────────────────────────
+        let do_lmr = is_quiet && !gives_check && extension == 0
+            && quiet_searched > LMR_MIN_QUIET && depth >= LMR_MIN_DEPTH;
+
+        let score = if legal_count == 1 {
+            // First legal move: full window, full depth
+            -negamax(board, new_depth, ply + 1, -beta, -alpha, ctx, true, mv)
         } else {
-            -negamax(board, depth - 1 + extension, ply + 1, -beta, -alpha, ctx, true)
+            // LMR: try reduced depth with null window
+            let search_depth = if do_lmr {
+                new_depth.saturating_sub(lmr_reduction(quiet_searched))
+            } else {
+                new_depth
+            };
+
+            let mut s = -negamax(board, search_depth, ply + 1, -alpha - 1, -alpha, ctx, true, mv);
+
+            // If LMR failed high, re-search at full depth with null window
+            if s > alpha && search_depth < new_depth {
+                s = -negamax(board, new_depth, ply + 1, -alpha - 1, -alpha, ctx, true, mv);
+            }
+
+            // PVS: if null window failed high, re-search with full window
+            if s > alpha && s < beta {
+                s = -negamax(board, new_depth, ply + 1, -beta, -alpha, ctx, true, mv);
+            }
+
+            s
         };
 
         board.unmake_move(mv, state);
         ctx.eval.pop();
         ctx.position_history.pop();
 
-        if is_quiet { quiet_count += 1; }
-
         if score > best {
-            best = score;
+            best      = score;
             best_move = mv;
         }
         if score > alpha { alpha = score; }
@@ -760,14 +976,14 @@ fn negamax(
             if is_quiet {
                 ctx.killers.update(mv, ply);
                 ctx.history.update(us, mv.from_sq().0, mv.to_sq().0, depth);
+                ctx.countermoves.update(prev_move, mv);
             }
             ctx.tt.store(board.hash, depth, to_tt_score(best, ply), Bound::Lower, best_move);
             return best;
         }
     }
 
-    if !has_legal {
-        // Distance-to-mate: prefer faster mates.
+    if legal_count == 0 {
         return if in_check { -CHECKMATE_SCORE + ply as i32 } else { 0 };
     }
 
@@ -777,19 +993,20 @@ fn negamax(
 }
 
 // ── Quiescence search ─────────────────────────────────────────────────────────
-// Extends the search with captures (and all moves when in check) to avoid
-// evaluating positions at a tactical horizon.
 
 fn quiescence(board: &mut Board, ply: usize, mut alpha: i32, beta: i32, ctx: &mut SearchContext) -> i32 {
     if ctx.aborted() { return 0; }
     ctx.nodes += 1;
     let in_check = board.is_in_check();
 
-    if !in_check {
-        let stand_pat = ctx.eval.eval_stm(board);
-        if stand_pat >= beta { return stand_pat; }
-        alpha = alpha.max(stand_pat);
-    }
+    let stand_pat = if !in_check {
+        let sp = ctx.eval.eval_stm(board);
+        if sp >= beta { return sp; }
+        alpha = alpha.max(sp);
+        sp
+    } else {
+        NEG_INF
+    };
 
     let pseudo = generate_pseudo_legal(board);
     let n = pseudo.len();
@@ -797,15 +1014,16 @@ fn quiescence(board: &mut Board, ply: usize, mut alpha: i32, beta: i32, ctx: &mu
     let mut scores = [0i32; 256];
     moves[..n].copy_from_slice(pseudo.as_slice());
 
-    // Score captures/promos by MVV-LVA; quiet moves get SCORE_QUIET_SKIP so
-    // they sort to the back and are skipped by the break below (unless in check).
     for i in 0..n {
         let mv = moves[i];
         scores[i] = if mv.is_promo() {
-            SCORE_PROMO_BASE + piece_value(mv.promo_piece_type())
+            if mv.promo_piece_type() == PieceType::Queen { SCORE_QUEEN_PROMO }
+            else { SCORE_UNDERPROMO }
         } else if board.piece_at(mv.to_sq()).is_some() || mv.is_en_passant() {
-            capture_mvv_lva(board, mv)
+            let s = see(board, mv);
+            if s >= 0 { SCORE_GOOD_CAPTURE + s } else { SCORE_BAD_CAPTURE + s }
         } else if in_check {
+            // When in check, search all moves ordered by history
             ctx.history.get(board.side_to_move, mv.from_sq().0, mv.to_sq().0)
         } else {
             SCORE_QUIET_SKIP
@@ -822,13 +1040,18 @@ fn quiescence(board: &mut Board, ply: usize, mut alpha: i32, beta: i32, ctx: &mu
         scores.swap(i, bi);
 
         let mv = moves[i];
-        // Once sorted, the first quiet move means all remaining are quiet too.
-        if !in_check
-            && board.piece_at(mv.to_sq()).is_none()
-            && !mv.is_en_passant()
-            && !mv.is_promo()
-        {
-            break;
+        if scores[i] <= SCORE_QUIET_SKIP { break; }
+
+        let is_capture = board.piece_at(mv.to_sq()).is_some() || mv.is_en_passant();
+
+        // ── Delta pruning ─────────────────────────────────────────────────────
+        // Skip captures that can't raise alpha even with the best possible gain.
+        if !in_check && is_capture && !mv.is_promo() {
+            let capture_val = board.piece_at(mv.to_sq())
+                .map_or(SEE_VALUES[0], |p| SEE_VALUES[p.piece_type as usize]);
+            if stand_pat + capture_val + DELTA_MARGIN < alpha {
+                continue;
+            }
         }
 
         ctx.eval.push_move(board, mv);
@@ -898,6 +1121,47 @@ mod tests {
         assert!(b2.is_in_check() || !generate_legal(&b2).is_empty());
     }
 
+    #[test]
+    fn see_winning_capture() {
+        // Queen on e1 captures undefended pawn on e5 (same file, no defenders): SEE = +100
+        let b = board("7k/8/8/4p3/8/8/8/4QK2 w - - 0 1");
+        let legal = generate_legal(&b);
+        let mv = legal.as_slice().iter().find(|m| {
+            b.piece_at(m.to_sq()).is_some()
+        }).copied().expect("must have a capture");
+        assert!(see(&b, mv) > 0, "queen takes undefended pawn should be winning");
+    }
+
+    #[test]
+    fn see_losing_capture() {
+        // Queen on e1 captures pawn on e4 defended by pawn on d5: SEE should be negative
+        let b = board("7k/8/8/3p4/4p3/8/8/4QK2 w - - 0 1");
+        let legal = generate_legal(&b);
+        let captures: Vec<_> = legal.as_slice().iter()
+            .filter(|m| b.piece_at(m.to_sq()).is_some())
+            .collect();
+        let has_losing = captures.iter().any(|&&m| see(&b, m) < 0);
+        assert!(has_losing, "at least one capture should be losing (queen takes defended pawn)");
+    }
+
+    #[test]
+    fn insufficient_material_kk() {
+        let b = board("4k3/8/8/8/8/8/8/4K3 w - - 0 1");
+        assert!(is_insufficient_material(&b));
+    }
+
+    #[test]
+    fn insufficient_material_kbk() {
+        let b = board("4k3/8/8/8/8/8/8/3BK3 w - - 0 1");
+        assert!(is_insufficient_material(&b));
+    }
+
+    #[test]
+    fn sufficient_material_krk() {
+        let b = board("4k3/8/8/8/8/8/8/3RK3 w - - 0 1");
+        assert!(!is_insufficient_material(&b));
+    }
+
     /// Nodes-per-second benchmark. Run with:
     ///   cargo test speed -- --nocapture --include-ignored
     #[test]
@@ -905,12 +1169,11 @@ mod tests {
     fn speed() {
         use std::time::Instant;
 
-        // A mix of positions: opening, middlegame, endgame.
         let positions = [
-            ("startpos",          "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"),
-            ("kiwipete",          "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1"),
-            ("middlegame",        "r1bq1rk1/pp2bppp/2n1pn2/3p4/3P4/2NBPN2/PPQ2PPP/R1B2RK1 w - - 4 10"),
-            ("endgame",           "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1"),
+            ("startpos",   "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"),
+            ("kiwipete",   "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1"),
+            ("middlegame",  "r1bq1rk1/pp2bppp/2n1pn2/3p4/3P4/2NBPN2/PPQ2PPP/R1B2RK1 w - - 4 10"),
+            ("endgame",    "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1"),
         ];
 
         let depth = 8;
@@ -935,13 +1198,6 @@ mod tests {
         println!("total               nodes {:>10}  time {:>6} ms  nps {:>10}", total_nodes, total_ms, avg_nps);
     }
 
-    /// NNUE nodes-per-second benchmark. Requires `networks/nnue.bin` (run from project root).
-    ///
-    /// Debug build (fast to run, NPS numbers unrealistic):
-    ///   cargo test speed_nnue -- --nocapture --include-ignored
-    ///
-    /// Release build (accurate NPS, recommended):
-    ///   cargo test --release speed_nnue -- --nocapture --include-ignored
     #[test]
     #[ignore]
     fn speed_nnue() {
@@ -963,12 +1219,10 @@ mod tests {
         ];
 
         let depth = 8u32;
-        let mut total_nodes_s = 0u64;
-        let mut total_ms_s    = 0u64;
-        let mut total_nodes_n = 0u64;
-        let mut total_ms_n    = 0u64;
+        let mut total_nodes_s = 0u64; let mut total_ms_s = 0u64;
+        let mut total_nodes_n = 0u64; let mut total_ms_n = 0u64;
 
-        println!("{:<12}  {:^46}  {:^46}", "", "── Static eval ──────────────────────────", "── NNUE eval ────────────────────────────");
+        println!("{:<12}  {:^46}  {:^46}", "", "── Static eval ──", "── NNUE eval ────");
         println!("{:<12}  {:>10}  {:>8}  {:>10}  {:>10}  {:>8}  {:>10}", "position", "nodes", "time ms", "nps", "nodes", "time ms", "nps");
         println!("{}", "─".repeat(95));
 
@@ -978,15 +1232,15 @@ mod tests {
             let mut se = AlphaBetaEngine::with_depth(depth);
             let t0 = Instant::now();
             se.choose_move(&b);
-            let ms_s  = t0.elapsed().as_millis() as u64;
-            let nd_s  = se.nodes_searched();
+            let ms_s = t0.elapsed().as_millis() as u64;
+            let nd_s = se.nodes_searched();
             let nps_s = if ms_s > 0 { nd_s * 1000 / ms_s } else { nd_s * 1000 };
 
             let mut ne = AlphaBetaEngine::with_nnue(depth, nnue.clone());
             let t1 = Instant::now();
             ne.choose_move(&b);
-            let ms_n  = t1.elapsed().as_millis() as u64;
-            let nd_n  = ne.nodes_searched();
+            let ms_n = t1.elapsed().as_millis() as u64;
+            let nd_n = ne.nodes_searched();
             let nps_n = if ms_n > 0 { nd_n * 1000 / ms_n } else { nd_n * 1000 };
 
             println!("{name:<12}  {nd_s:>10}  {ms_s:>8}  {nps_s:>10}  {nd_n:>10}  {ms_n:>8}  {nps_n:>10}");

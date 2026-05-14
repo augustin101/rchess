@@ -10,7 +10,7 @@ use crate::engine::nnue::Nnue;
 use crate::engine::time_manager::TimeManager;
 
 
-const MAX_SEARCH_DEPTH: u32 = 30;
+const MAX_SEARCH_DEPTH: u32 = 40;
 
 // ── Move parsing ──────────────────────────────────────────────────────────────
 
@@ -142,10 +142,17 @@ fn make_engine(nnue: &Option<Arc<Nnue>>) -> AlphaBetaEngine {
 
 // ── Main UCI loop ─────────────────────────────────────────────────────────────
 
+/// Entry point called by the binary.  Swallows broken-pipe errors (the GUI
+/// closed its end of the pipe) and panics on any other I/O error.
 pub fn run(use_nnue: bool) {
-    let stdin  = io::stdin();
-    let stdout = io::stdout();
+    match run_inner(use_nnue) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::BrokenPipe => {}
+        Err(e) => panic!("UCI I/O error: {e}"),
+    }
+}
 
+fn run_inner(use_nnue: bool) -> io::Result<()> {
     // Try embedded weights first, then fall back to the runtime path from engine.toml.
     // Pass --no-nnue to force static evaluation regardless of available weights.
     // Prefer compile-time embedded weights (embed-nnue feature); fall back to
@@ -158,10 +165,14 @@ pub fn run(use_nnue: bool) {
         None
     };
 
-    let mut engine         = make_engine(&nnue);
-    let mut board          = Board::starting_position();
-    let mut hash_history:    Vec<u64> = Vec::new();
-    let mut move_overhead_ms: u64 = 30;
+    let mut engine            = make_engine(&nnue);
+    let mut board             = Board::starting_position();
+    let mut hash_history      = Vec::<u64>::new();
+    let mut move_overhead_ms  = 30u64;
+
+    let stdin  = io::stdin();
+    let stdout = io::stdout();
+    let mut out = io::BufWriter::new(stdout.lock());
 
     for line in stdin.lock().lines() {
         let line = match line { Ok(l) => l, Err(_) => break };
@@ -170,18 +181,18 @@ pub fn run(use_nnue: bool) {
         match line {
             "uci" => {
                 let eval_label = if nnue.is_some() { "NNUE" } else { "static" };
-                println!("id name rchess ({eval_label})");
-                println!("id author augustin101");
-                println!("option name Move Overhead type spin default 30 min 0 max 5000");
-                println!("option name Hash type spin default 16 min 1 max 1024");
-                println!("option name Threads type spin default 1 min 1 max 512");
-                println!("option name MultiPV type spin default 1 min 1 max 500");
-                println!("option name SyzygyPath type string default <empty>");
-                println!("option name UCI_ShowWDL type check default false");
-                println!("option name UCI_Chess960 type check default false");
-                println!("uciok");
+                writeln!(out, "id name rchess ({eval_label})")?;
+                writeln!(out, "id author augustin101")?;
+                writeln!(out, "option name Move Overhead type spin default 30 min 0 max 5000")?;
+                writeln!(out, "option name Hash type spin default 16 min 1 max 1024")?;
+                writeln!(out, "option name Threads type spin default 1 min 1 max 512")?;
+                writeln!(out, "option name MultiPV type spin default 1 min 1 max 500")?;
+                writeln!(out, "option name SyzygyPath type string default <empty>")?;
+                writeln!(out, "option name UCI_ShowWDL type check default false")?;
+                writeln!(out, "option name UCI_Chess960 type check default false")?;
+                writeln!(out, "uciok")?;
             }
-            "isready"    => println!("readyok"),
+            "isready" => { writeln!(out, "readyok")?; }
             "ucinewgame" => {
                 engine       = make_engine(&nnue);
                 board        = Board::starting_position();
@@ -217,12 +228,12 @@ pub fn run(use_nnue: bool) {
                     engine.choose_move_timed(&board, tm, &hash_history)
                 };
                 let mv_str = mv.map_or_else(|| "0000".to_string(), |m| m.to_string());
-                println!("bestmove {mv_str}");
-                stdout.lock().flush().ok();
+                writeln!(out, "bestmove {mv_str}")?;
             }
             _ => {}
         }
 
-        stdout.lock().flush().ok();
+        out.flush()?;
     }
+    Ok(())
 }
