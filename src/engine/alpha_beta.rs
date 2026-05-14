@@ -589,7 +589,7 @@ impl AlphaBetaEngine {
     pub fn choose_move_timed(
         &mut self,
         board:        &Board,
-        mut tm:       TimeManager,
+        tm:           TimeManager,
         game_history: &[u64],
     ) -> Option<Move> {
         let mut b = board.clone();
@@ -628,8 +628,6 @@ impl AlphaBetaEngine {
                         if score <= lo && lo > NEG_INF {
                             delta = (delta * 2).min(ASPIRATION_MAX_DELTA);
                             lo    = lo.saturating_sub(delta).max(NEG_INF);
-                            tm.extend(0.20);
-                            self.ctx.hard_deadline = tm.hard_deadline;
                             continue;
                         } else if score >= hi && hi < POS_INF {
                             delta = (delta * 2).min(ASPIRATION_MAX_DELTA);
