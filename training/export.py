@@ -22,11 +22,10 @@ Binary layout (RNNUE2\\0\\0, all little-endian):
 
 Usage (run from project root):
     python training/export.py                              # checkpoints/best.pt → networks/nnue.bin
-    python training/export.py checkpoints/epoch_03.pt networks/nnue.bin
+    python training/export.py --ckpt checkpoints/epoch_03.pt --out networks/nnue.bin
 """
 
 import struct
-import sys
 import os
 import numpy as np
 import torch
@@ -176,6 +175,14 @@ def _sanity_check(model, ft_w_q, ft_b_q, l1_w_q, l1_b_q, l2_w_q, l2_b_q,
 
 
 if __name__ == "__main__":
-    ckpt = sys.argv[1] if len(sys.argv) > 1 else "checkpoints/best.pt"
-    out  = sys.argv[2] if len(sys.argv) > 2 else "networks/nnue.bin"
-    export(ckpt, out)
+    import argparse
+    p = argparse.ArgumentParser(
+        description='Export NNUE checkpoint to quantised binary',
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    p.add_argument('--ckpt', default='checkpoints/best.pt',
+                   help='Checkpoint to export')
+    p.add_argument('--out',  default='networks/nnue.bin',
+                   help='Output binary path')
+    args = p.parse_args()
+    export(args.ckpt, args.out)
