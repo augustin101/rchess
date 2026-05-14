@@ -216,10 +216,15 @@ struct SearchContext {
     eval:           Evaluator,
     /// Shared with the TimeManager — set true to stop the search immediately.
     abort:          Arc<AtomicBool>,
-    /// Nodes between each wall-clock check (power of 2: 2048 normal, 256 panic).
+    /// Nodes between each wall-clock check.
     check_interval: u64,
     /// Pre-computed hard deadline; refreshed by the ID loop on time extensions.
     hard_deadline:  Instant,
+    /// Position hashes for threefold-repetition detection.
+    /// Layout: [game history before search root] ++ [current search path ancestors].
+    position_history: Vec<u64>,
+    /// Number of entries that belong to the game history (before the search root).
+    game_history_len: usize,
 }
 
 impl SearchContext {
@@ -334,14 +339,16 @@ impl AlphaBetaEngine {
             depth,
             name,
             ctx: SearchContext {
-                tt:             TranspositionTable::new(),
-                killers:        KillerTable::new(),
-                history:        HistoryTable::new(),
-                nodes:          0,
+                tt:               TranspositionTable::new(),
+                killers:          KillerTable::new(),
+                history:          HistoryTable::new(),
+                nodes:            0,
                 eval,
-                abort:          Arc::new(AtomicBool::new(false)),
-                check_interval: NORMAL_CHECK_INTERVAL,
-                hard_deadline:  Instant::now() + Duration::from_secs(86_400),
+                abort:            Arc::new(AtomicBool::new(false)),
+                check_interval:   NORMAL_CHECK_INTERVAL,
+                hard_deadline:    Instant::now() + Duration::from_secs(86_400),
+                position_history: Vec::new(),
+                game_history_len: 0,
             },
             last_score: None,
         }
@@ -364,12 +371,20 @@ impl AlphaBetaEngine {
     /// * **Aspiration windows** — used from depth 4+; time is extended on failure.
     /// * Returns the result from the **last fully completed depth** so a partial
     ///   search aborted mid-tree never corrupts the chosen move.
-    pub fn choose_move_timed(&mut self, board: &Board, mut tm: TimeManager) -> Option<Move> {
+    pub fn choose_move_timed(
+        &mut self,
+        board:        &Board,
+        mut tm:       TimeManager,
+        game_history: &[u64],
+    ) -> Option<Move> {
         let mut b = board.clone();
         self.ctx.killers = KillerTable::new();
         self.ctx.history.age();
         self.ctx.eval.init(&b);
         self.ctx.prepare(&tm);
+        self.ctx.position_history.clear();
+        self.ctx.position_history.extend_from_slice(game_history);
+        self.ctx.game_history_len = game_history.len();
 
         let mut best:        Move        = Move::NULL;
         let mut prev_score:  Option<i32> = None;
@@ -441,6 +456,8 @@ impl Engine for AlphaBetaEngine {
         self.ctx.history.age();
         self.ctx.eval.init(&b);
         self.ctx.prepare(&tm);
+        self.ctx.position_history.clear();
+        self.ctx.game_history_len = 0;
         let mut best = Move::NULL;
         self.last_score = None;
         for d in 1..=self.depth {
@@ -501,6 +518,7 @@ fn search_root(
         scores.swap(i, bi);
 
         let mv = moves[i];
+        ctx.position_history.push(board.hash);
         ctx.eval.push_move(board, mv);
         let state = board.make_move(mv);
 
@@ -508,6 +526,7 @@ fn search_root(
         if king_bb == EMPTY || board.is_attacked_by(lsb(king_bb), board.side_to_move) {
             board.unmake_move(mv, state);
             ctx.eval.pop();
+            ctx.position_history.pop();
             continue;
         }
 
@@ -515,6 +534,7 @@ fn search_root(
         let score = -negamax(board, depth - 1, 1, -beta, -alpha, ctx, true);
         board.unmake_move(mv, state);
         ctx.eval.pop();
+        ctx.position_history.pop();
 
         // Hard abort: don't update best with a partial/garbage result
         if ctx.aborted() { break; }
@@ -557,6 +577,20 @@ fn negamax(
     {
         ctx.abort.store(true, Ordering::Relaxed);
         return 0;
+    }
+
+    // ── Draw detection ────────────────────────────────────────────────────────
+    // 50-move rule: 100 half-moves without a pawn move or capture.
+    if board.half_move_clock >= 100 { return 0; }
+
+    // Threefold repetition:
+    //   • game_reps >= 2 → position seen twice before the search root (3rd here)
+    //   • search_reps >= 1 → position seen once in current search path (engine cycling)
+    {
+        let gl          = ctx.game_history_len;
+        let game_reps   = ctx.position_history[..gl].iter().filter(|&&h| h == board.hash).count();
+        let search_reps = ctx.position_history[gl..].iter().filter(|&&h| h == board.hash).count();
+        if game_reps >= 2 || search_reps >= 1 { return 0; }
     }
 
     if depth == 0 {
@@ -634,6 +668,7 @@ fn negamax(
 
         if futility_prunable && is_quiet { continue; }
 
+        ctx.position_history.push(board.hash);
         ctx.eval.push_move(board, mv);
         let state = board.make_move(mv);
 
@@ -641,6 +676,7 @@ fn negamax(
         if king_bb == EMPTY || board.is_attacked_by(lsb(king_bb), board.side_to_move) {
             board.unmake_move(mv, state);
             ctx.eval.pop();
+            ctx.position_history.pop();
             continue;
         }
 
@@ -667,6 +703,7 @@ fn negamax(
 
         board.unmake_move(mv, state);
         ctx.eval.pop();
+        ctx.position_history.pop();
 
         if is_quiet { quiet_count += 1; }
 

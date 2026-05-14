@@ -51,7 +51,9 @@ fn parse_move(board: &Board, s: &str) -> Option<Move> {
 
 // ── Position command ──────────────────────────────────────────────────────────
 
-fn parse_position(line: &str) -> Option<Board> {
+/// Returns the board and the hash of every position visited before reaching it,
+/// so the engine can detect threefold repetitions during search.
+fn parse_position(line: &str) -> Option<(Board, Vec<u64>)> {
     let rest = line.strip_prefix("position ")?;
 
     let (mut board, moves_str) = if let Some(r) = rest.strip_prefix("startpos") {
@@ -67,11 +69,13 @@ fn parse_position(line: &str) -> Option<Board> {
         return None;
     };
 
+    let mut history: Vec<u64> = Vec::new();
     for mv_str in moves_str.split_whitespace() {
+        history.push(board.hash);   // record hash BEFORE the move
         let mv = parse_move(&board, mv_str)?;
         board.make_move(mv);
     }
-    Some(board)
+    Some((board, history))
 }
 
 // ── Go command: time budget ───────────────────────────────────────────────────
@@ -154,8 +158,9 @@ pub fn run(use_nnue: bool) {
         None
     };
 
-    let mut engine = make_engine(&nnue);
-    let mut board  = Board::starting_position();
+    let mut engine         = make_engine(&nnue);
+    let mut board          = Board::starting_position();
+    let mut hash_history:    Vec<u64> = Vec::new();
     let mut move_overhead_ms: u64 = 30;
 
     for line in stdin.lock().lines() {
@@ -178,8 +183,9 @@ pub fn run(use_nnue: bool) {
             }
             "isready"    => println!("readyok"),
             "ucinewgame" => {
-                engine = make_engine(&nnue);
-                board  = Board::starting_position();
+                engine       = make_engine(&nnue);
+                board        = Board::starting_position();
+                hash_history = Vec::new();
             }
             "quit" => break,
             "stop" => {}
@@ -195,8 +201,9 @@ pub fn run(use_nnue: bool) {
                 }
             }
             _ if line.starts_with("position") => {
-                if let Some(b) = parse_position(line) {
-                    board = b;
+                if let Some((b, h)) = parse_position(line) {
+                    board        = b;
+                    hash_history = h;
                 }
             }
             _ if line.starts_with("go") => {
@@ -207,7 +214,7 @@ pub fn run(use_nnue: bool) {
                     let go = parse_go(line);
                     let (tm, max_depth) = create_time_manager(&go, board.side_to_move, move_overhead_ms);
                     engine.set_depth(max_depth);
-                    engine.choose_move_timed(&board, tm)
+                    engine.choose_move_timed(&board, tm, &hash_history)
                 };
                 let mv_str = mv.map_or_else(|| "0000".to_string(), |m| m.to_string());
                 println!("bestmove {mv_str}");
