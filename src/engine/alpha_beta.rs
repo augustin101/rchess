@@ -16,6 +16,49 @@ const NEG_INF: i32 = -(CHECKMATE_SCORE + 1);
 const POS_INF: i32 =   CHECKMATE_SCORE + 1;
 const MAX_PLY: usize = 64;
 
+// ── Mate-score TT adjustment ──────────────────────────────────────────────────
+// Mate scores encode distance-to-mate from the ROOT (e.g. "mated at ply 5").
+// That root-relative distance must be converted to a node-relative distance
+// when reading/writing the TT so that the same position reached via two paths
+// of different length gets a consistent score.
+//
+//   to_tt  : call before ctx.tt.store  — converts ply-relative → root-relative
+//   from_tt: call after  ctx.tt.probe  — converts root-relative → ply-relative
+//
+// Any score whose absolute value exceeds CHECKMATE_SCORE - MAX_PLY is a mate.
+
+const MATE_THRESHOLD: i32 = CHECKMATE_SCORE - MAX_PLY as i32;
+
+#[inline]
+fn to_tt_score(score: i32, ply: usize) -> i32 {
+    let p = ply as i32;
+    if      score >  MATE_THRESHOLD { score + p }
+    else if score < -MATE_THRESHOLD { score - p }
+    else                            { score }
+}
+
+#[inline]
+fn from_tt_score(score: i32, ply: usize) -> i32 {
+    let p = ply as i32;
+    if      score >  MATE_THRESHOLD { score - p }
+    else if score < -MATE_THRESHOLD { score + p }
+    else                            { score }
+}
+
+// ── Ply-distance penalty ──────────────────────────────────────────────────────
+// A won position reached at ply 4 is worth more than the same position at ply 12.
+// Subtracting ply from the magnitude forces the engine to prefer faster wins and
+// slower losses, breaking ties between equal-looking endgame moves.
+//
+// The sign-preserving cap ensures a slightly winning position (e.g. +5 cp at ply
+// 20) collapses to 0 rather than flipping to negative — keeping the search sane.
+
+#[inline]
+fn apply_ply_penalty(score: i32, ply: usize) -> i32 {
+    let penalty = (ply as i32).min(score.abs());
+    score - score.signum() * penalty
+}
+
 // ── Time management ───────────────────────────────────────────────────────────
 
 /// Check the hard deadline every this many nodes (must be a power of 2).
@@ -601,10 +644,11 @@ fn negamax(
     let original_alpha = alpha;
     let tt_move = match ctx.tt.probe(board.hash, depth) {
         Some(e) => {
+            let tt_score = from_tt_score(e.score, ply);
             match e.bound {
-                Bound::Exact => return e.score,
-                Bound::Lower => { alpha = alpha.max(e.score); if alpha >= beta { return e.score; } }
-                Bound::Upper => { beta  = beta.min(e.score);  if alpha >= beta { return e.score; } }
+                Bound::Exact => return tt_score,
+                Bound::Lower => { alpha = alpha.max(tt_score); if alpha >= beta { return tt_score; } }
+                Bound::Upper => { beta  = beta.min(tt_score);  if alpha >= beta { return tt_score; } }
                 Bound::None  => {}
             }
             e.best_move
@@ -717,7 +761,7 @@ fn negamax(
                 ctx.killers.update(mv, ply);
                 ctx.history.update(us, mv.from_sq().0, mv.to_sq().0, depth);
             }
-            ctx.tt.store(board.hash, depth, best, Bound::Lower, best_move);
+            ctx.tt.store(board.hash, depth, to_tt_score(best, ply), Bound::Lower, best_move);
             return best;
         }
     }
@@ -728,7 +772,7 @@ fn negamax(
     }
 
     let bound = if best > original_alpha { Bound::Exact } else { Bound::Upper };
-    ctx.tt.store(board.hash, depth, best, bound, best_move);
+    ctx.tt.store(board.hash, depth, to_tt_score(best, ply), bound, best_move);
     best
 }
 
@@ -806,7 +850,7 @@ fn quiescence(board: &mut Board, ply: usize, mut alpha: i32, beta: i32, ctx: &mu
     }
 
     if in_check && !has_legal { return -CHECKMATE_SCORE + ply as i32; }
-    alpha
+    apply_ply_penalty(alpha, ply)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

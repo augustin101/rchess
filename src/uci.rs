@@ -10,7 +10,7 @@ use crate::engine::nnue::Nnue;
 use crate::engine::time_manager::TimeManager;
 
 
-const MAX_SEARCH_DEPTH: u32 = 50;
+const MAX_SEARCH_DEPTH: u32 = 30;
 
 // ── Move parsing ──────────────────────────────────────────────────────────────
 

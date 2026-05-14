@@ -45,7 +45,10 @@ const CONCAT:          usize = L1_SIZE * 2;     // 512 — input to the output n
 pub const QA: i32 = 127;   // FT / accumulator quantisation scale
 pub const QB: i32 = 64;    // hidden-layer quantisation scale
 
-const EVAL_SCALE: i32 = 400;  // cp per unit of tanh output (from training)
+// SCALE_CP at training time was 400. Raising EVAL_SCALE above that stretches the
+// logit range, giving alpha-beta sharper centipawn differences to work with.
+// A value of 600 applies a 1.5× stretch; 800 applies 2×.
+const EVAL_SCALE: i32 = 600;
 
 const MAGIC: &[u8; 8] = b"RNNUE2\x00\x00";
 
