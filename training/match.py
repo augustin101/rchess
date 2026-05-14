@@ -269,13 +269,238 @@ def parse_score(info: str) -> str:
         if tok == 'mate' and i + 1 < len(parts): return f'mate {parts[i+1]}'
     return ''
 
-def moves_to_pgn(moves: list[str]) -> str:
-    out = []
-    for i, mv in enumerate(moves):
+# ── SAN conversion ───────────────────────────────────────────────────────────
+#
+# Converts UCI moves to Standard Algebraic Notation by replaying the position.
+# Handles: piece disambiguation, captures, castling, promotions, check (+/#).
+# Limitations: en-passant and castling are not generated in the legal-move
+# enumerator used for checkmate detection (# vs +), so very rare positions may
+# get '+' instead of '#'. All other SAN fields are correct.
+
+def _piece_attacks(sq_list: list, from_sq: int, piece: str) -> list[int]:
+    """Squares attacked by `piece` (e.g. 'N', 'n') sitting on from_sq."""
+    f, r  = from_sq % 8, from_sq // 8
+    pu    = piece.upper()
+    hits: list[int] = []
+
+    def _slide(dirs):
+        for df, dr in dirs:
+            cf, cr = f + df, r + dr
+            while 0 <= cf < 8 and 0 <= cr < 8:
+                s = cr * 8 + cf
+                hits.append(s)
+                if sq_list[s] != '.':
+                    break
+                cf += df; cr += dr
+
+    if pu == 'N':
+        for df, dr in [(2,1),(2,-1),(-2,1),(-2,-1),(1,2),(1,-2),(-1,2),(-1,-2)]:
+            nf, nr = f+df, r+dr
+            if 0 <= nf < 8 and 0 <= nr < 8:
+                hits.append(nr*8+nf)
+    if pu in ('B', 'Q'):
+        _slide([(1,1),(1,-1),(-1,1),(-1,-1)])
+    if pu in ('R', 'Q'):
+        _slide([(1,0),(-1,0),(0,1),(0,-1)])
+    if pu == 'K':
+        for df, dr in [(1,0),(-1,0),(0,1),(0,-1),(1,1),(1,-1),(-1,1),(-1,-1)]:
+            nf, nr = f+df, r+dr
+            if 0 <= nf < 8 and 0 <= nr < 8:
+                hits.append(nr*8+nf)
+    if pu == 'P':
+        dr = 1 if piece.isupper() else -1
+        for df in (-1, 1):
+            nf, nr = f+df, r+dr
+            if 0 <= nf < 8 and 0 <= nr < 8:
+                hits.append(nr*8+nf)
+    return hits
+
+
+def _is_attacked(sq_list: list, target: int, by_white: bool) -> bool:
+    """Is `target` square attacked by any piece belonging to `by_white`?"""
+    for s in range(64):
+        p = sq_list[s]
+        if p == '.' or p.isupper() != by_white:
+            continue
+        if target in _piece_attacks(sq_list, s, p):
+            return True
+    return False
+
+
+def _apply_sq(sq_list: list, uci: str) -> list:
+    """Return a NEW sq_list with the UCI move applied (non-destructive)."""
+    sl = list(sq_list)
+    fc = ord(uci[0])-ord('a'); fr = int(uci[1])-1
+    tc = ord(uci[2])-ord('a'); tr = int(uci[3])-1
+    promo = uci[4].upper() if len(uci) > 4 else None
+    fs = fr*8+fc; ts = tr*8+tc
+    piece = sl[fs]; cap = sl[ts]
+    # en passant
+    if piece.upper() == 'P' and fc != tc and cap == '.':
+        sl[fr*8+tc] = '.'
+    placed = (promo if piece.isupper() else promo.lower()) if promo else piece
+    sl[ts] = placed; sl[fs] = '.'
+    # castling: move rook
+    if piece.upper() == 'K' and abs(fc-tc) == 2:
+        if tc > fc:
+            sl[fr*8+5] = sl[fr*8+7]; sl[fr*8+7] = '.'
+        else:
+            sl[fr*8+3] = sl[fr*8+0]; sl[fr*8+0] = '.'
+    return sl
+
+
+def _king_sq(sq_list: list, white: bool) -> int:
+    k = 'K' if white else 'k'
+    for s in range(64):
+        if sq_list[s] == k:
+            return s
+    return -1
+
+
+def _in_check(sq_list: list, white: bool) -> bool:
+    ks = _king_sq(sq_list, white)
+    return ks >= 0 and _is_attacked(sq_list, ks, not white)
+
+
+def _pseudo_moves(sq_list: list, white: bool) -> list[str]:
+    """Pseudo-legal moves for `white`'s pieces (enough for checkmate detection)."""
+    moves: list[str] = []
+    for fs in range(64):
+        p = sq_list[fs]
+        if p == '.' or p.isupper() != white:
+            continue
+        f, r = fs % 8, fs // 8
+        pu = p.upper()
+        fa = chr(ord('a')+f); ra = str(r+1)
+
+        if pu == 'P':
+            dr = 1 if white else -1
+            # single push
+            nr = r + dr
+            if 0 <= nr < 8:
+                ts = nr*8+f
+                if sq_list[ts] == '.':
+                    nra = str(nr+1)
+                    if nr in (0, 7):  # promotion rank
+                        for pp in ('q','r','b','n'):
+                            moves.append(f'{fa}{ra}{fa}{nra}{pp}')
+                    else:
+                        moves.append(f'{fa}{ra}{fa}{nra}')
+                    # double push from home rank
+                    if (white and r == 1) or (not white and r == 6):
+                        ts2 = (nr+dr)*8+f
+                        if sq_list[ts2] == '.':
+                            moves.append(f'{fa}{ra}{fa}{nr+dr+1}')
+            # pawn captures
+            for df in (-1, 1):
+                nf, nrr = f+df, r+dr
+                if 0 <= nf < 8 and 0 <= nrr < 8:
+                    ts = nrr*8+nf
+                    cap = sq_list[ts]
+                    if cap != '.' and cap.isupper() != white:
+                        nra = str(nrr+1); nfa = chr(ord('a')+nf)
+                        if nrr in (0, 7):
+                            for pp in ('q','r','b','n'):
+                                moves.append(f'{fa}{ra}{nfa}{nra}{pp}')
+                        else:
+                            moves.append(f'{fa}{ra}{nfa}{nra}')
+        else:
+            for ts in _piece_attacks(sq_list, fs, p):
+                cap = sq_list[ts]
+                if cap == '.' or cap.isupper() != white:
+                    tf = chr(ord('a')+ts%8); tr2 = str(ts//8+1)
+                    moves.append(f'{fa}{ra}{tf}{tr2}')
+    return moves
+
+
+def _has_legal_move(sq_list: list, white: bool) -> bool:
+    """Does `white` have at least one legal move (king not left in check)?"""
+    for uci in _pseudo_moves(sq_list, white):
+        if not _in_check(_apply_sq(sq_list, uci), white):
+            return True
+    return False
+
+
+def san_from_uci(board: 'Board', uci: str) -> str:
+    """Convert a UCI move string to SAN given the *current* board position."""
+    fc = ord(uci[0])-ord('a'); fr = int(uci[1])-1
+    tc = ord(uci[2])-ord('a'); tr = int(uci[3])-1
+    promo = uci[4].upper() if len(uci) > 4 else None
+    fs = fr*8+fc; ts = tr*8+tc
+    piece    = board.sq[fs]
+    pu       = piece.upper()
+    is_white = piece.isupper()
+    cap      = board.sq[ts]
+    dest     = f'{chr(ord("a")+tc)}{tr+1}'
+
+    # ── Castling ──────────────────────────────────────────────────────────────
+    if pu == 'K' and abs(fc-tc) == 2:
+        san  = 'O-O' if tc > fc else 'O-O-O'
+        sl2  = _apply_sq(board.sq, uci)
+        opp  = not is_white
+        if _in_check(sl2, opp):
+            san += '#' if not _has_legal_move(sl2, opp) else '+'
+        return san
+
+    is_ep  = pu == 'P' and fc != tc and cap == '.'
+    is_cap = cap != '.' or is_ep
+
+    # ── Pawn ──────────────────────────────────────────────────────────────────
+    if pu == 'P':
+        san = (f'{chr(ord("a")+fc)}x{dest}' if is_cap else dest)
+        if promo:
+            san += f'={promo}'
+
+    # ── Piece (N/B/R/Q/K) ────────────────────────────────────────────────────
+    else:
+        # Disambiguation: find other pieces of same type that can also reach ts
+        # legally (i.e., without leaving their own king in check).
+        ambig: list[int] = []
+        for s in range(64):
+            if s == fs:
+                continue
+            p2 = board.sq[s]
+            if p2 == '.' or p2.upper() != pu or p2.isupper() != is_white:
+                continue
+            if ts not in _piece_attacks(board.sq, s, p2):
+                continue
+            # Check legality of that alternative move
+            uci2 = f'{chr(ord("a")+s%8)}{s//8+1}{dest}'
+            if not _in_check(_apply_sq(board.sq, uci2), is_white):
+                ambig.append(s)
+
+        disambig = ''
+        if ambig:
+            other_files = {s % 8 for s in ambig}
+            other_ranks = {s // 8 for s in ambig}
+            if fc not in other_files:
+                disambig = chr(ord('a')+fc)           # file sufficient
+            elif fr not in other_ranks:
+                disambig = str(fr+1)                   # rank sufficient
+            else:
+                disambig = f'{chr(ord("a")+fc)}{fr+1}' # full square
+
+        san = f'{pu}{disambig}{"x" if is_cap else ""}{dest}'
+
+    # ── Check / checkmate suffix ──────────────────────────────────────────────
+    sl2 = _apply_sq(board.sq, uci)
+    opp = not is_white
+    if _in_check(sl2, opp):
+        san += '#' if not _has_legal_move(sl2, opp) else '+'
+
+    return san
+
+
+def _moves_to_san_pgn(moves: list[str]) -> str:
+    """Replay a game from the start and produce a PGN move-text in SAN."""
+    board = Board()
+    parts: list[str] = []
+    for i, uci in enumerate(moves):
         if i % 2 == 0:
-            out.append(f'{i // 2 + 1}.')
-        out.append(mv)
-    return ' '.join(out)
+            parts.append(f'{i // 2 + 1}.')
+        parts.append(san_from_uci(board, uci))
+        board.apply(uci)
+    return ' '.join(parts)
 
 
 # ── Display ───────────────────────────────────────────────────────────────────
@@ -345,8 +570,8 @@ def build(root: Path) -> Path:
 
 # ── Game ─────────────────────────────────────────────────────────────────────
 
-INC_MS = 2_000
-BASE_MS = 300_000
+INC_MS  = 1_000    # 1-second increment
+BASE_MS = 60_000   # 1-minute base time
 
 def play_game(
     ew: Engine, eb: Engine,
@@ -472,10 +697,9 @@ def append_pgn(
             f'[White "{white}"]\n'
             f'[Black "{black}"]\n'
             f'[Result "{res}"]\n'
-            f'[TimeControl "300+2"]\n'
-            f'; Moves are UCI long algebraic notation\n'
+            f'[TimeControl "60+1"]\n'
             f'\n'
-            f'{moves_to_pgn(moves)} {{{reason}}} {res}\n\n'
+            f'{_moves_to_san_pgn(moves)} {{{reason}}} {res}\n\n'
         )
 
 
