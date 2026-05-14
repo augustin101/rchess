@@ -62,7 +62,7 @@ fn apply_ply_penalty(score: i32, ply: usize) -> i32 {
 // ── Time management ───────────────────────────────────────────────────────────
 
 /// Check the hard deadline every this many nodes (must be a power of 2).
-const NORMAL_CHECK_INTERVAL: u64 = 2048;
+const NORMAL_CHECK_INTERVAL: u64 = 1024;
 /// Tighter interval when the clock is nearly empty.
 const PANIC_CHECK_INTERVAL:  u64 = 256;
 

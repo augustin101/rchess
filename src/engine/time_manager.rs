@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 const MOVES_TO_GO_K:   u64 = 20;   // denominator constant in the formula
 const INC_FRACTION:    f64 = 0.8;  // fraction of increment to use
 const SOFT_FRACTION:   f64 = 0.6;  // soft = 0.6 × T_target
-const HARD_FRACTION:   f64 = 1.5;  // hard = 1.5 × T_target
+const HARD_FRACTION:   f64 = 1.2;  // hard = 1.2 × T_target
 
 pub const PANIC_MS: u64 = 500;     // switch to panic mode below this (ms remaining)
 
